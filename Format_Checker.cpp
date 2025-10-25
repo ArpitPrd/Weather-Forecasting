@@ -1,5 +1,5 @@
 #define BN_LIB
-#include "starter.cpp"   // use existing parser & data structures
+#include "startup_code.cpp"   // use existing parser & data structures
 #include <cmath>
 #include <iomanip>
 
