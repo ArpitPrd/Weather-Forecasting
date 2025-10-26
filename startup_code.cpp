@@ -10,6 +10,8 @@
 #include <cmath>
 #include <algorithm> 
 #include <random>    
+#include <numeric> // Added for std::accumulate
+#include <limits>  // Added for std::numeric_limits
 
 using namespace std;
 
@@ -19,11 +21,12 @@ network read_network(const string& filename);
 void write_network(const network& BayesNet, const string& filename);
 int get_value_index(const class Graph_Node& node, const string& value);
 void learn_cpts_mle(network& bn, const vector<vector<string>>& dataset, float pseudo_count);
-string sample_missing_value_approx(const network& bn, const vector<string>& incomplete_record,
+vector<vector<string>> read_data(const string& filename);
+vector<float> calculate_posterior(const network& bn, const vector<string>& record,
                                   int missing_index, const map<string, int>& name_to_index);
 void learn_parameters_em(network& bn, const vector<vector<string>>& raw_data, 
-                         int N_iterations, int N_samples_per_missing, const vector<string>& node_names);
-vector<vector<string>> read_data(const string& filename);
+                         int N_iterations);
+
 
 // ==========================================================================================
 // BAYESIAN NETWORK CLASS DEFINITIONS
@@ -50,7 +53,7 @@ public:
         return Node_Name;
     }
 
-    vector<int> get_children() const {
+    const vector<int>& get_children() const {
         return Children;
     }
 
@@ -600,7 +603,7 @@ int get_value_index(const Graph_Node& node, const string& value) {
 
 
 // ------------------------------------------------------------------------------------------
-// 2. MLE CALCULATION (M-STEP)
+// 2. MLE CALCULATION (FOR INITIALIZATION)
 // ------------------------------------------------------------------------------------------
 
 void learn_cpts_mle(network& bn, const vector<vector<string>>& dataset, float pseudo_count = 1.0) {
@@ -703,84 +706,112 @@ void learn_cpts_mle(network& bn, const vector<vector<string>>& dataset, float ps
     }
 }
 
+
 // ------------------------------------------------------------------------------------------
-// 3. E-STEP (SAMPLING/IMPUTATION) HELPER
+// 3. E-STEP HELPER: CALCULATE POSTERIOR P(Xm | MarkovBlanket(Xm))
 // ------------------------------------------------------------------------------------------
 
-string sample_missing_value_approx(const network& bn, const vector<string>& incomplete_record,
+/**
+ * Calculates the posterior probability distribution of a missing variable Xm given all
+ * other observed variables in the record (d_obs).
+ * P(Xm | d_obs) \propto P(Xm | Parents(Xm)) * \prod_{Y \in Children(Xm)} P(Y=y_obs | Parents(Y))
+ */
+vector<float> calculate_posterior(const network& bn, const vector<string>& record,
                                   int missing_index, const map<string, int>& name_to_index) {
     
     auto missing_node_it = bn.getNodeConst(missing_index);
+    int nvalues = missing_node_it->get_nvalues();
+    vector<float> posterior(nvalues, 1.0f);
+
+    // --- Term 1: P(Xm | Parents(Xm)) ---
     const auto& parents = missing_node_it->get_Parents();
-    const auto& possible_values = missing_node_it->get_values();
-    int num_child_values = missing_node_it->get_nvalues();
-
-    int parent_config_index = 0;
-    long long multiplier = 1;
+    const auto& cpt = missing_node_it->get_CPT();
     
-    for (const auto& pname : parents) {
-        if (name_to_index.count(pname) == 0) {
-             cerr << "Error (Sample): Parent " << pname << " not in map." << endl;
-             return "?";
-        }
-        int p_idx = name_to_index.at(pname); 
-        
-        if (incomplete_record[p_idx] == "?") {
-             return "?"; 
-        }
-        
-        auto pnode_it = bn.getNodeConst(p_idx); 
-        int val_idx = get_value_index(*pnode_it, incomplete_record[p_idx]);
+    long long xm_parent_config_index = 0;
+    long long multiplier = 1;
 
-        if (val_idx == -1) {
-            return "?"; 
-        }
-
-        parent_config_index += val_idx * multiplier;
+    for (const string& pname : parents) {
+        int p_idx = name_to_index.at(pname);
+        // All parents of Xm must be known, since only Xm is missing
+        auto pnode_it = bn.getNodeConst(p_idx);
+        int val_idx = get_value_index(*pnode_it, record[p_idx]);
+        xm_parent_config_index += (long long)val_idx * multiplier;
         multiplier *= pnode_it->get_nvalues();
     }
 
-    const auto& cpt = missing_node_it->get_CPT();
-    int cpt_start_index = parent_config_index * num_child_values;
-    
-    vector<float> conditional_probs(num_child_values);
-    float sum_probs = 0.0f;
-    for (int k = 0; k < num_child_values; ++k) {
-        if (cpt_start_index + k >= cpt.size()) {
-             cerr << "Error (Sample): CPT index out of bounds for node " << missing_node_it->get_name() << endl;
-             return "?";
-        }
-        conditional_probs[k] = cpt[cpt_start_index + k];
-        sum_probs += conditional_probs[k];
-    }
-
-    if (sum_probs < 1e-6) {
-        static random_device rd;
-        static mt19937 gen(rd());
-        uniform_int_distribution<> dis(0, possible_values.size() - 1);
-        return possible_values[dis(gen)];
-    }
-    
-    if (abs(sum_probs - 1.0) > 1e-5) {
-        for (int k = 0; k < num_child_values; ++k) {
-            conditional_probs[k] /= sum_probs;
+    for (int k = 0; k < nvalues; ++k) {
+        long long cpt_index = xm_parent_config_index * nvalues + k;
+        if (cpt_index < cpt.size()) {
+            posterior[k] *= cpt[cpt_index];
+        } else {
+            posterior[k] *= (1.0f / nvalues); // Failsafe for uninitialized CPT
         }
     }
 
-    static random_device rd;
-    static mt19937 gen(rd());
-    uniform_real_distribution<> dis(0.0, 1.0);
-    float rand_val = dis(gen);
+
+    // --- Term 2: \prod_{Y \in Children(Xm)} P(Y=y_obs | Parents(Y)) ---
+    const auto& children_indices = missing_node_it->get_children();
     
-    float cumulative_prob = 0.0;
-    for (int k = 0; k < num_child_values; ++k) {
-        cumulative_prob += conditional_probs[k];
-        if (rand_val < cumulative_prob) {
-            return possible_values[k];
+    for (int child_idx : children_indices) {
+        auto child_node_it = bn.getNodeConst(child_idx);
+        const auto& child_parents = child_node_it->get_Parents();
+        const auto& child_cpt = child_node_it->get_CPT();
+        int child_nvalues = child_node_it->get_nvalues();
+        
+        // The child's value MUST be known
+        string y_val_str = record[child_idx];
+        int y_val_idx = get_value_index(*child_node_it, y_val_str);
+        if (y_val_idx == -1) continue; // Should not happen if y_val_str != "?"
+
+        // We need to calculate P(Y=y_obs | Parents(Y)) for *each* possible value of Xm
+        for (int k = 0; k < nvalues; ++k) { // k is the hypothetical value_index of Xm
+            
+            long long y_parent_config_index = 0;
+            long long y_multiplier = 1;
+
+            for (const string& ypname : child_parents) {
+                int yp_idx = name_to_index.at(ypname);
+                int val_idx = -1;
+
+                if (yp_idx == missing_index) {
+                    val_idx = k; // Use the hypothetical value of Xm
+                } else {
+                    // Use the observed value of the other parent
+                    auto ypnode_it = bn.getNodeConst(yp_idx);
+                    val_idx = get_value_index(*ypnode_it, record[yp_idx]);
+                }
+                
+                y_parent_config_index += (long long)val_idx * y_multiplier;
+                
+                auto ypnode_it = bn.getNodeConst(yp_idx); // Need this to get nvalues
+                y_multiplier *= ypnode_it->get_nvalues();
+            }
+
+            long long child_cpt_index = y_parent_config_index * child_nvalues + y_val_idx;
+            if(child_cpt_index < child_cpt.size()) {
+                 posterior[k] *= child_cpt[child_cpt_index];
+            } else {
+                 posterior[k] *= (1.0f / child_nvalues); // Failsafe
+            }
         }
     }
+
+    // --- Normalize ---
+    float sum_probs = std::accumulate(posterior.begin(), posterior.end(), 0.0f);
     
-    return possible_values.back();
+    if (sum_probs < 1e-9) {
+        // All probabilities were 0, return uniform distribution
+        for (int k = 0; k < nvalues; ++k) {
+            posterior[k] = 1.0f / nvalues;
+        }
+    } else {
+        // Normalize to sum to 1
+        for (int k = 0; k < nvalues; ++k) {
+            posterior[k] /= sum_probs;
+        }
+    }
+
+    return posterior;
 }
 
 
@@ -789,7 +820,7 @@ string sample_missing_value_approx(const network& bn, const vector<string>& inco
 // ------------------------------------------------------------------------------------------
 
 void learn_parameters_em(network& bn, const vector<vector<string>>& raw_data, 
-                         int N_iterations, int N_samples_per_missing, const vector<string>& node_names) {
+                         int N_iterations) {
     
     map<string, int> name_to_index;
     for (int i = 0; i < bn.netSize(); ++i) {
@@ -825,41 +856,202 @@ void learn_parameters_em(network& bn, const vector<vector<string>>& raw_data,
         cerr << "Error: No complete data found. Cannot initialize CPTs via MLE. Exiting EM." << endl;
         return;
     }
-    learn_cpts_mle(bn, complete_data, 1.0); 
+    float pseudo_count = 0.1; // Laplace smoothing
+    learn_cpts_mle(bn, complete_data, pseudo_count); 
     cout << "Initial CPTs computed using MLE on complete data." << endl;
     
+    int n_nodes = bn.netSize();
 
-    cout << "\n--- Step 2 & 3: Starting EM Iterations (N=" << N_iterations << ") ---" << endl;
+    cout << "\n--- Step 2 & 3: Starting EM Iterations (Max N=" << N_iterations << ") ---" << endl;
     for (int iter = 0; iter < N_iterations; ++iter) {
-        cout << "\n--- Iteration " << iter + 1 << "/" << N_iterations << " ---" << endl;
         
-        vector<vector<string>> imputed_dataset = complete_data;
-        cout << "  E-Step: Generating " << N_samples_per_missing << " samples for each of " << incomplete_data_templates.size() << " incomplete records." << endl;
-        
-        int imputed_count = 0;
-        for (const auto& item : incomplete_data_templates) {
-            const vector<string>& incomplete_record = item.first;
-            int missing_index = item.second;
-            
-            for (int k = 0; k < N_samples_per_missing; ++k) {
-                vector<string> new_record = incomplete_record;
-                string sampled_value = sample_missing_value_approx(bn, incomplete_record, missing_index, name_to_index);
-                
-                if (sampled_value != "?") {
-                    new_record[missing_index] = sampled_value;
-                    imputed_dataset.push_back(new_record);
-                    imputed_count++;
-                }
+        // --- E-STEP: Calculate Expected Counts ---
+        cout << "  --- Iteration " << iter + 1 << "/" << N_iterations << " ---" << endl;
+        cout << "  E-Step: Calculating expected counts..." << endl;
+
+        // Store expected counts: map<node_index, vector<float>>
+        map<int, vector<float>> expected_numerators;
+        map<int, vector<float>> expected_denominators;
+
+        // Initialize all counts with the pseudo_count for smoothing
+        for (int i = 0; i < n_nodes; ++i) {
+            auto node_it = bn.getNode(i);
+            int nvalues = node_it->get_nvalues();
+            long long cpt_size = nvalues;
+            for(const auto& pname : node_it->get_Parents()) {
+                cpt_size *= bn.getNode(name_to_index.at(pname))->get_nvalues();
             }
+            
+            long long denom_size = cpt_size / nvalues;
+            expected_numerators[i] = vector<float>(cpt_size, pseudo_count);
+            expected_denominators[i] = vector<float>(denom_size, (float)nvalues * pseudo_count);
         }
 
-        cout << "  Imputed " << imputed_count << " records. Total dataset size for M-step: " << imputed_dataset.size() << endl;
+        // --- Process all data (complete and incomplete) ---
+        for (const auto& record : raw_data) {
+            int missing_index = -1;
+            for(int j=0; j < record.size(); ++j) {
+                if(record[j] == "?") {
+                    missing_index = j;
+                    break;
+                }
+            }
 
+            if (missing_index == -1) {
+                // --- CASE 1: Complete Row ---
+                // Add 1.0 to the observed counts for every node
+                for (int i = 0; i < n_nodes; ++i) {
+                    auto node_it = bn.getNodeConst(i);
+                    const auto& parents = node_it->get_Parents();
+                    int nvalues = node_it->get_nvalues();
+                    int c_val_idx = get_value_index(*node_it, record[i]);
+
+                    long long parent_config_index = 0;
+                    long long multiplier = 1;
+                    for(const string& pname : parents) {
+                        int p_idx = name_to_index.at(pname);
+                        auto pnode_it = bn.getNodeConst(p_idx);
+                        int val_idx = get_value_index(*pnode_it, record[p_idx]);
+                        parent_config_index += (long long)val_idx * multiplier;
+                        multiplier *= pnode_it->get_nvalues();
+                    }
+                    
+                    long long num_index = parent_config_index * nvalues + c_val_idx;
+                    expected_numerators[i][num_index] += 1.0f;
+                    expected_denominators[i][parent_config_index] += 1.0f;
+                }
+
+            } else {
+                // --- CASE 2: Incomplete Row (Xm is missing) ---
+                vector<float> posterior = calculate_posterior(bn, record, missing_index, name_to_index);
+                int xm_nvalues = bn.getNode(missing_index)->get_nvalues();
+
+                // Add fractional counts for every node
+                for (int i = 0; i < n_nodes; ++i) {
+                    auto node_it = bn.getNodeConst(i);
+                    const auto& parents = node_it->get_Parents();
+                    int nvalues = node_it->get_nvalues();
+                    
+                    bool is_missing_node = (i == missing_index);
+                    bool is_child_of_missing = false;
+                    for (const auto& pname : parents) {
+                        if (name_to_index.at(pname) == missing_index) {
+                            is_child_of_missing = true;
+                            break;
+                        }
+                    }
+
+                    if (!is_missing_node && !is_child_of_missing) {
+                        // Node is unrelated to the missing one. Treat as complete.
+                        int c_val_idx = get_value_index(*node_it, record[i]);
+                        if (c_val_idx == -1) continue;
+
+                        long long parent_config_index = 0;
+                        long long multiplier = 1;
+                        for(const string& pname : parents) {
+                            int p_idx = name_to_index.at(pname);
+                            auto pnode_it = bn.getNodeConst(p_idx);
+                            int val_idx = get_value_index(*pnode_it, record[p_idx]);
+                            parent_config_index += (long long)val_idx * multiplier;
+                            multiplier *= pnode_it->get_nvalues();
+                        }
+                        
+                        long long num_index = parent_config_index * nvalues + c_val_idx;
+                        expected_numerators[i][num_index] += 1.0f;
+                        expected_denominators[i][parent_config_index] += 1.0f;
+
+                    } else if (is_missing_node) {
+                        // Node *is* the missing one (Xm)
+                        // Get config of its (known) parents
+                        long long parent_config_index = 0;
+                        long long multiplier = 1;
+                        for(const string& pname : parents) {
+                            int p_idx = name_to_index.at(pname);
+                            auto pnode_it = bn.getNodeConst(p_idx);
+                            int val_idx = get_value_index(*pnode_it, record[p_idx]);
+                            parent_config_index += (long long)val_idx * multiplier;
+                            multiplier *= pnode_it->get_nvalues();
+                        }
+
+                        // Add fractional counts for each possible value of Xm
+                        for (int k = 0; k < xm_nvalues; ++k) {
+                            long long num_index = parent_config_index * nvalues + k;
+                            expected_numerators[i][num_index] += posterior[k];
+                            expected_denominators[i][parent_config_index] += posterior[k];
+                        }
+
+                    } else if (is_child_of_missing) {
+                        // Node is a child (Y) of the missing one (Xm)
+                        int y_val_idx = get_value_index(*node_it, record[i]);
+                        if (y_val_idx == -1) continue;
+
+                        // Add fractional counts for each possible state of Xm
+                        for (int k = 0; k < xm_nvalues; ++k) { // k is hypothetical value_index of Xm
+                            long long parent_config_index = 0;
+                            long long multiplier = 1;
+                            for(const string& pname : parents) {
+                                int p_idx = name_to_index.at(pname);
+                                int val_idx = -1;
+                                if (p_idx == missing_index) {
+                                    val_idx = k; // Use hypothetical value
+                                } else {
+                                    auto pnode_it = bn.getNodeConst(p_idx);
+                                    val_idx = get_value_index(*pnode_it, record[p_idx]);
+                                }
+                                parent_config_index += (long long)val_idx * multiplier;
+                                auto pnode_it = bn.getNodeConst(p_idx);
+                                multiplier *= pnode_it->get_nvalues();
+                            }
+                            
+                            long long num_index = parent_config_index * nvalues + y_val_idx;
+                            expected_numerators[i][num_index] += posterior[k];
+                            expected_denominators[i][parent_config_index] += posterior[k];
+                        }
+                    }
+                }
+            }
+        } // end for each record
+
+        // --- M-STEP: Recompute CPTs from Expected Counts ---
         cout << "  M-Step: Recomputing CPTs..." << endl;
-        learn_cpts_mle(bn, imputed_dataset, 1.0); 
-        
-        cout << "Iteration " << iter + 1 << " complete." << endl;
-    }
+        float max_change = 0.0f;
+
+        for (int i = 0; i < n_nodes; ++i) {
+            auto node_it = bn.getNode(i);
+            int nvalues = node_it->get_nvalues();
+            const auto& old_cpt = node_it->get_CPT();
+            vector<float> new_cpt(old_cpt.size());
+            
+            const auto& numerators = expected_numerators.at(i);
+            const auto& denominators = expected_denominators.at(i);
+            
+            for (int j = 0; j < denominators.size(); ++j) { // For each parent config
+                float total_count = denominators[j];
+                for (int k = 0; k < nvalues; ++k) { // For each child value
+                    long long cpt_index = (long long)j * nvalues + k;
+                    if (total_count < 1e-9) {
+                        new_cpt[cpt_index] = 1.0f / nvalues;
+                    } else {
+                        new_cpt[cpt_index] = numerators[cpt_index] / total_count;
+                    }
+
+                    if(cpt_index < old_cpt.size()) {
+                        max_change = std::max(max_change, std::fabs(new_cpt[cpt_index] - old_cpt[cpt_index]));
+                    }
+                }
+            }
+            node_it->set_CPT(new_cpt);
+        }
+
+        cout << "  Iteration " << iter + 1 << " complete. Max CPT change: " << max_change << endl;
+
+        // --- Convergence Check ---
+        if (max_change < 1e-7) {
+            cout << "\n--- EM Converged after " << iter + 1 << " iterations ---" << endl;
+            break;
+        }
+
+    } // end for iterations
     
     cout << "\n--- EM Algorithm Complete ---" << endl;
 }
@@ -874,11 +1066,11 @@ int main() {
     // This is the main function for your EM algorithm
     network BayesNet = read_network("hailfinder.bif");
     
-    vector<string> node_names;
-    for(int i = 0; i < BayesNet.netSize(); ++i) {
-        node_names.push_back(BayesNet.getNode(i)->get_name());
+    // Check if network load was successful
+    if (BayesNet.netSize() == 0) {
+        cerr << "Fatal Error: Network structure load failed. Cannot proceed." << endl;
+        return 1;
     }
-
     cout << "Network structure loaded successfully! Number of nodes: " << BayesNet.netSize() << endl;
     
     vector<vector<string>> raw_data = read_data("records.dat");
@@ -889,19 +1081,16 @@ int main() {
     
     if (raw_data.size() > 0 && raw_data[0].size() != BayesNet.netSize()) {
         cerr << "Error: Number of data columns (" << raw_data[0].size() << ") does not match number of network nodes (" << BayesNet.netSize() << ")." << endl;
-        if (BayesNet.netSize() == 0) {
-             cerr << "Fatal Error: Network structure load failed. Cannot proceed with EM." << endl;
-             return 1;
-        }
          cerr << "Warning: Mismatch between data and network structure. Results may be incorrect." << endl;
     }
 
     cout << "Data loaded successfully! Total raw records: " << raw_data.size() << endl;
 
-    const int N_ITERATIONS = 30; // N
-    const int N_SAMPLES_PER_MISSING = 5; // variable number
+    // Max number of iterations. The algorithm will stop early if it converges.
+    const int N_ITERATIONS = 20; 
     
-    learn_parameters_em(BayesNet, raw_data, N_ITERATIONS, N_SAMPLES_PER_MISSING, node_names);
+    // N_samples_per_missing is no longer needed for deterministic EM
+    learn_parameters_em(BayesNet, raw_data, N_ITERATIONS);
     
     write_network(BayesNet, "solved.bif");
 
