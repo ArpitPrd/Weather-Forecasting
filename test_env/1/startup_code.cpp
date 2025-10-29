@@ -9,7 +9,7 @@
 #include <iomanip>
 #include <cmath>
 #include <algorithm> 
-#include <random>       // For random initialization and batch sampling
+#include <random>       // For random initialization
 #include <numeric>      // For std::accumulate
 #include <limits>       // For std::numeric_limits
 #include <chrono>       // For time-keeping
@@ -25,24 +25,29 @@ void write_network(const network& BayesNet, const string& filename);
 int get_value_index(const Graph_Node& node, const string& value);
 vector<vector<string>> read_data(const string& filename);
 
-// --- NEW/MODIFIED FUNCTION DECLARATIONS ---
+// --- MODIFIED FUNCTION DECLARATIONS ---
 long long get_parent_config_index(const Graph_Node& node, const network& bn, 
                                   const map<string, int>& name_to_index, 
                                   const map<int, int>& parent_val_indices);
 long long get_cpt_index(const Graph_Node& node, const network& bn, 
                         const map<string, int>& name_to_index, 
                         int child_val_idx, const map<int, int>& parent_val_indices);
-pair<vector<float>, double> calculate_posterior_and_likelihood(
-                                  const network& bn, const vector<string>& record,
-                                  int missing_index, const map<string, int>& name_to_index);
+
+// --- FUNCTIONS RE-ADDED FOR MULTI-START ---
+void initialize_cpts_randomly(network& bn, const map<string, int>& name_to_index,
+                                std::mt19937& rng);
 double calculate_observed_log_likelihood(
                                   const network& bn, const vector<vector<string>>& raw_data,
                                   const map<string, int>& name_to_index);
-void initialize_cpts_randomly(network& bn, const map<string, int>& name_to_index,
-                                std::mt19937& rng);
+// ---
+                    
 void learn_parameters_em(network& bn, const vector<vector<string>>& raw_data, 
                          const map<string, int>& name_to_index,
-                         int N_iterations, int batch_size, std::mt19937& rng);
+                         int N_iterations, float convergence_threshold);
+                         
+pair<vector<float>, double> calculate_posterior_and_likelihood(
+                                  const network& bn, const vector<string>& record,
+                                  int missing_index, const map<string, int>& name_to_index);
 
 
 // ==========================================================================================
@@ -485,7 +490,7 @@ void write_network(const network& BayesNet, const string& filename) {
         return;
     }
     
-    outfile << "// Bayesian Network (Learned via Stochastic EM)" << endl << endl;
+    outfile << "// Bayesian Network (Learned via Multi-Start Full-Batch EM)" << endl << endl;
 
     for (int i = 0; i < BayesNet.netSize(); ++i) {
         auto node_it = BayesNet.getNodeConst(i); 
@@ -614,7 +619,7 @@ vector<vector<string>> read_data(const string& filename) {
 }
 
 // ------------------------------------------------------------------------------------------
-// 2. EM ALGORITHM HELPER FUNCTIONS
+// 2. HELPER FUNCTIONS
 // ------------------------------------------------------------------------------------------
 
 /**
@@ -631,7 +636,7 @@ int get_value_index(const Graph_Node& node, const string& value) {
 }
 
 /**
- * NEW: Modular helper to get the parent configuration index (the "row" of the CPT).
+ * Helper to get the parent configuration index (the "row" of the CPT).
  * Assumes parent_val_indices is a map of {parent_index -> parent_value_index}.
  */
 long long get_parent_config_index(const Graph_Node& node, const network& bn, 
@@ -646,9 +651,6 @@ long long get_parent_config_index(const Graph_Node& node, const network& bn,
         int val_idx = 0;
         if(parent_val_indices.count(p_idx)) {
              val_idx = parent_val_indices.at(p_idx);
-        } else {
-             // This can happen if a parent is missing but we are not that parent
-             // In our 1-missing-val case, this shouldn't be an issue.
         }
         
         parent_config_index += (long long)val_idx * multiplier;
@@ -660,7 +662,7 @@ long long get_parent_config_index(const Graph_Node& node, const network& bn,
 }
 
 /**
- * NEW: Modular helper to get the full CPT index (row + column).
+ * Helper to get the full CPT index (row + column).
  */
 long long get_cpt_index(const Graph_Node& node, const network& bn, 
                         const map<string, int>& name_to_index, 
@@ -672,45 +674,7 @@ long long get_cpt_index(const Graph_Node& node, const network& bn,
 
 
 /**
- * NEW: Initializes all CPTs to random (but normalized) probabilities.
- * This is crucial for the multi-start strategy.
- */
-void initialize_cpts_randomly(network& bn, const map<string, int>& name_to_index,
-                                std::mt19937& rng) {
-    
-    std::uniform_real_distribution<float> dist(0.0, 1.0);
-
-    for (int i = 0; i < bn.netSize(); ++i) {
-        auto node_it = bn.getNode(i);
-        int nvalues = node_it->get_nvalues();
-
-        long long cpt_size = nvalues;
-        for (const auto& pname : node_it->get_Parents()) {
-            cpt_size *= bn.getNode(name_to_index.at(pname))->get_nvalues();
-        }
-
-        vector<float> new_cpt(cpt_size);
-        long long parent_configs = cpt_size / nvalues;
-
-        for (long long j = 0; j < parent_configs; ++j) {
-            float sum = 0.0f;
-            for (int k = 0; k < nvalues; ++k) {
-                float rand_val = dist(rng) + 1e-6f; // Add epsilon to avoid 0
-                new_cpt[j * nvalues + k] = rand_val;
-                sum += rand_val;
-            }
-            // Normalize
-            for (int k = 0; k < nvalues; ++k) {
-                new_cpt[j * nvalues + k] /= sum;
-            }
-        }
-        node_it->set_CPT(new_cpt);
-    }
-}
-
-
-/**
- * MODIFIED: Calculates posterior P(Xm | d_obs) using LOG PROBABILITIES.
+ * Calculates posterior P(Xm | d_obs) using LOG PROBABILITIES.
  * Returns a pair:
  * 1. The normalized posterior vector (for E-step)
  * 2. The log-likelihood of the observed data log(P(d_obs)) (for scoring)
@@ -814,8 +778,50 @@ pair<vector<float>, double> calculate_posterior_and_likelihood(
     return {final_posterior, log_likelihood_of_record};
 }
 
+
+// ------------------------------------------------------------------------------------------
+// 3. MLE/RANDOM INITIALIZATION FUNCTIONS
+// ------------------------------------------------------------------------------------------
+
 /**
- * NEW: Scorer function to calculate the total log-likelihood of the
+ * Initializes all CPTs to random (but normalized) probabilities.
+ * This is crucial for the multi-start strategy.
+ */
+void initialize_cpts_randomly(network& bn, const map<string, int>& name_to_index,
+                                std::mt19937& rng) {
+    
+    std::uniform_real_distribution<float> dist(0.0, 1.0);
+
+    for (int i = 0; i < bn.netSize(); ++i) {
+        auto node_it = bn.getNode(i);
+        int nvalues = node_it->get_nvalues();
+
+        long long cpt_size = nvalues;
+        for (const auto& pname : node_it->get_Parents()) {
+            cpt_size *= bn.getNode(name_to_index.at(pname))->get_nvalues();
+        }
+
+        vector<float> new_cpt(cpt_size);
+        long long parent_configs = cpt_size / nvalues;
+
+        for (long long j = 0; j < parent_configs; ++j) {
+            float sum = 0.0f;
+            for (int k = 0; k < nvalues; ++k) {
+                float rand_val = dist(rng) + 1e-6f; // Add epsilon to avoid 0
+                new_cpt[j * nvalues + k] = rand_val;
+                sum += rand_val;
+            }
+            // Normalize
+            for (int k = 0; k < nvalues; ++k) {
+                new_cpt[j * nvalues + k] /= sum;
+            }
+        }
+        node_it->set_CPT(new_cpt);
+    }
+}
+
+/**
+ * Scorer function to calculate the total log-likelihood of the
  * entire observed dataset. Used to compare networks from different restarts.
  */
 double calculate_observed_log_likelihood(
@@ -868,28 +874,117 @@ double calculate_observed_log_likelihood(
 }
 
 
+// NOTE: learn_cpts_mle is no longer used for seeding, but
+// is kept here in case it's needed for other strategies.
+// We are using initialize_cpts_randomly instead.
+void learn_cpts_mle(network& bn, const vector<vector<string>>& dataset, 
+                    const map<string, int>& name_to_index, float pseudo_count) {
+    
+    if (dataset.empty()) {
+        cerr << "Error (MLE): Dataset is empty." << endl;
+        return;
+    }
+    
+    for (int i = 0; i < bn.netSize(); ++i) {
+        auto node_it = bn.getNode(i); 
+        const auto& node_name = node_it->get_name();
+        const auto& parents = node_it->get_Parents();
+        int num_child_values = node_it->get_nvalues();
+
+        // Calculate CPT size
+        long long cpt_size = num_child_values;
+        for (const auto& pname : parents) {
+            if (name_to_index.count(pname) == 0) {
+                cerr << "Error (MLE): Parent " << pname << " for node " 
+                     << node_name << " not in map." << endl;
+                return;
+            }
+            auto pnode_it = bn.getNode(name_to_index.at(pname));
+            cpt_size *= pnode_it->get_nvalues();
+        }
+
+        // Initialize counts with pseudo-count (smoothing)
+        vector<float> numerators(cpt_size, pseudo_count);
+        vector<float> denominators(cpt_size / num_child_values, (float)num_child_values * pseudo_count);
+        
+        // --- Count occurrences ---
+        for (const auto& record : dataset) {
+            if (record.size() != bn.netSize()) continue; // Skip malformed rows
+            
+            map<int, int> parent_val_indices;
+            bool record_valid = true;
+            
+            // Get parent values
+            for (const auto& pname : parents) {
+                int p_idx = name_to_index.at(pname);
+                auto pnode_it = bn.getNodeConst(p_idx);
+                int val_idx = get_value_index(*pnode_it, record[p_idx]);
+                if (val_idx == -1) { // Should not happen in complete data
+                    record_valid = false;
+                    break;
+                }
+                parent_val_indices[p_idx] = val_idx;
+            }
+            if (!record_valid) continue;
+
+            // Get child value
+            int child_idx = name_to_index.at(node_name);
+            int c_val_idx = get_value_index(*node_it, record[child_idx]);
+            if (c_val_idx == -1) continue; // Should not happen
+            
+            // Get CPT indices
+            long long parent_config_index = get_parent_config_index(*node_it, bn, name_to_index, parent_val_indices);
+            long long cpt_index = parent_config_index * num_child_values + c_val_idx;
+            
+            if (cpt_index >= numerators.size() || parent_config_index >= denominators.size()) {
+                 cerr << "FATAL (MLE): Index out of bounds." << endl;
+                 return;
+            }
+            
+            // Increment counts
+            numerators[cpt_index]++;
+            denominators[parent_config_index]++;
+        }
+
+        // --- Normalize counts to get probabilities ---
+        vector<float> new_cpt(cpt_size);
+        for (long long j = 0; j < denominators.size(); ++j) {
+            float total_count = denominators[j];
+            for (int k = 0; k < num_child_values; ++k) {
+                long long cpt_index = j * num_child_values + k;
+                
+                if (total_count < 1e-9) { // Avoid division by zero
+                    new_cpt[cpt_index] = 1.0f / num_child_values; 
+                } else {
+                    new_cpt[cpt_index] = numerators[cpt_index] / total_count;
+                }
+            }
+        }
+        
+        node_it->set_CPT(new_cpt);
+    }
+}
+
+
 // ------------------------------------------------------------------------------------------
-// 4. EM LEARNING FUNCTION (Mini-Batch)
+// 4. EM LEARNING FUNCTION (Full-Batch)
 // ------------------------------------------------------------------------------------------
 
 /**
- * MODIFIED: Implements Stochastic Mini-Batch EM.
- * 1. E-Step: Initializes counts to 0, processes a random batch of data.
- * 2. M-Step: Applies pseudo-count smoothing *once* during CPT update.
+ * MODIFIED: Implements standard, full-batch EM.
+ * This is now a refinement step, so we don't need mini-batching.
+ * It will run for N_iterations OR until CPTs stop changing.
  */
 void learn_parameters_em(network& bn, const vector<vector<string>>& raw_data, 
                          const map<string, int>& name_to_index,
-                         int N_iterations, int batch_size, std::mt19937& rng) {
+                         int N_iterations, float convergence_threshold) {
     
     int n_nodes = bn.netSize();
-    const float pseudo_count = 0.1f; // Smoothing applied in M-step
-    
-    // For sampling records
-    std::uniform_int_distribution<int> data_sampler(0, raw_data.size() - 1);
+    const float pseudo_count = 0.5f; // Standard smoothing for all EM steps
 
     for (int iter = 0; iter < N_iterations; ++iter) {
         
-        // --- E-STEP: Calculate Expected Counts from a Mini-Batch ---
+        // --- E-STEP: Calculate Expected Counts from FULL Dataset ---
         map<int, vector<float>> expected_numerators;
         map<int, vector<float>> expected_denominators;
 
@@ -907,12 +1002,9 @@ void learn_parameters_em(network& bn, const vector<vector<string>>& raw_data,
             expected_denominators[i] = vector<float>(denom_size, 0.0f);
         }
 
-        // --- Process a random mini-batch ---
-        for (int i_batch = 0; i_batch < batch_size; ++i_batch) {
+        // --- Process the FULL dataset ---
+        for (const auto& record : raw_data) {
             
-            // Sample a random record
-            const auto& record = raw_data[data_sampler(rng)];
-
             int missing_index = -1;
             for(int j=0; j < record.size(); ++j) {
                 if(record[j] == "?") {
@@ -1025,14 +1117,11 @@ void learn_parameters_em(network& bn, const vector<vector<string>>& raw_data,
                     }
                 }
             }
-        } // end for mini-batch
+        } // end for full-batch
 
         // --- M-STEP: Recompute CPTs from Expected Counts ---
-        // We update the CPTs by blending the new counts with the old CPTs.
-        // This is a standard practice in stochastic/online EM.
-        // We use a learning rate: eta = (iter + 2)^-0.7
-        // (iter + 2) to avoid issues with iter=0. 0.7 is a common decay rate.
-        float eta = std::pow(iter + 2.0f, -0.7f);
+        
+        float max_change = 0.0f; // For checking convergence
 
         for (int i = 0; i < n_nodes; ++i) {
             auto node_it = bn.getNode(i);
@@ -1055,32 +1144,27 @@ void learn_parameters_em(network& bn, const vector<vector<string>>& raw_data,
                     long long cpt_index = (long long)j * nvalues + k;
                     float smoothed_num = numerators[cpt_index] + pseudo_count;
                     
-                    float batch_prob; // The probability from this batch
                     if (smoothed_den < 1e-9) {
-                        batch_prob = 1.0f / nvalues;
+                        new_cpt[cpt_index] = 1.0f / nvalues;
                     } else {
-                        batch_prob = smoothed_num / smoothed_den;
+                        new_cpt[cpt_index] = smoothed_num / smoothed_den;
                     }
-
-                    // Blend old and new probabilities
-                    // new = (1 - eta) * old + eta * batch
-                    new_cpt[cpt_index] = (1.0f - eta) * old_cpt[cpt_index] + eta * batch_prob;
+                    
+                    // Track max change
+                    if(cpt_index < old_cpt.size()) {
+                        max_change = std::max(max_change, std::fabs(new_cpt[cpt_index] - old_cpt[cpt_index]));
+                    }
                 }
             }
-            // Normalize the new CPT row just in case of float drift
-            for (int j = 0; j < denominators.size(); ++j) {
-                float row_sum = 0.0f;
-                for(int k=0; k < nvalues; ++k) row_sum += new_cpt[j*nvalues + k];
-                if (row_sum > 1e-9) {
-                    for(int k=0; k < nvalues; ++k) new_cpt[j*nvalues + k] /= row_sum;
-                }
-            }
-
             node_it->set_CPT(new_cpt);
         }
 
-        if ((iter + 1) % 50 == 0) {
-            cout << "  ... Iteration " << iter + 1 << " complete." << endl;
+        cout << "  ... Iteration " << iter + 1 << " complete. Max CPT change: " << max_change << endl;
+
+        // Check for convergence
+        if (max_change < convergence_threshold) {
+            cout << "  ... Converged after " << iter + 1 << " iterations." << endl;
+            break;
         }
 
     } // end for iterations
@@ -1088,7 +1172,7 @@ void learn_parameters_em(network& bn, const vector<vector<string>>& raw_data,
 
 
 // ==========================================================================================
-// MAIN FUNCTION (Multi-Start EM Controller)
+// MAIN FUNCTION (Seeded EM Controller)
 // ==========================================================================================
 
 #ifndef BN_LIB
@@ -1102,21 +1186,20 @@ int main(int argc, char* argv[]) {
     string data_file = argv[2];
 
     // --- Algorithm Hyperparameters ---
-    const int NUM_RESTARTS = 10;        // Run 10 different random initializations
-    const int N_ITERATIONS = 100;       // Iterations *per restart*
-    const float BATCH_SIZE_PERCENT = 0.20f; // Use 20% of data per iteration
-    const long TIME_LIMIT_MS = 110000;  // 110 seconds (to be safe for 2min limit)
+    const float SEED_PSEUDO_COUNT = 0.1f;  // Smoothing for the initial MLE seed
+    const int EM_MAX_ITERATIONS = 100;     // Max iterations for refinement
+    const float EM_CONVERGENCE = 1e-7f;  // Stop when CPTs change by less than this
     // ---------------------------------
     
-    auto main_start_time = std::chrono::steady_clock::now();
+    cout << "=== Seeded EM Learner ===" << endl;
     
     // --- Load Data and Initial Network Structure ---
-    network base_network_structure = read_network(hailfinder_file);
-    if (base_network_structure.netSize() == 0) {
+    network BayesNet = read_network(hailfinder_file);
+    if (BayesNet.netSize() == 0) {
         cerr << "Fatal Error: Network structure load failed. Cannot proceed." << endl;
         return 1;
     }
-    cout << "Network structure loaded successfully! Nodes: " << base_network_structure.netSize() << endl;
+    cout << "Network structure loaded successfully! Nodes: " << BayesNet.netSize() << endl;
     
     vector<vector<string>> raw_data = read_data(data_file);
     if (raw_data.empty()) {
@@ -1125,68 +1208,69 @@ int main(int argc, char* argv[]) {
     }
     cout << "Data loaded successfully! Records: " << raw_data.size() << endl;
 
-    int batch_size = static_cast<int>(raw_data.size() * BATCH_SIZE_PERCENT);
-    cout << "Using " << NUM_RESTARTS << " restarts, " 
-         << N_ITERATIONS << " iterations/restart, "
-         << "and mini-batch size of " << batch_size << "." << endl;
-
-    // --- Build Name-to-Index Map (Do this ONCE) ---
+    // Build Name-to-Index Map
     map<string, int> name_to_index;
-    for (int i = 0; i < base_network_structure.netSize(); ++i) {
-        name_to_index[base_network_structure.getNode(i)->get_name()] = i;
+    for (int i = 0; i < BayesNet.netSize(); ++i) {
+        name_to_index[BayesNet.getNode(i)->get_name()] = i;
     }
 
-    // --- Initialize RNG and Best-Network Tracking ---
-    std::random_device rd;
-    std::mt19937 rng(rd());
-    network best_network;
-    double best_likelihood = -std::numeric_limits<double>::infinity();
-
-    // --- MAIN RESTART LOOP ---
-    for (int restart = 0; restart < NUM_RESTARTS; ++restart) {
-        cout << "\n--- RESTART " << restart + 1 << "/" << NUM_RESTARTS << " ---" << endl;
-        
-        // 1. Create a fresh network copy
-        network current_network = read_network(hailfinder_file); // Re-read to reset CPTs
-        
-        // 2. Initialize it randomly
-        cout << "  Initializing CPTs randomly..." << endl;
-        initialize_cpts_randomly(current_network, name_to_index, rng);
-        
-        // 3. Train it using Mini-Batch EM
-        cout << "  Starting Stochastic EM..." << endl;
-        learn_parameters_em(current_network, raw_data, name_to_index, 
-                            N_ITERATIONS, batch_size, rng);
-        
-        // 4. Score it using the *full* dataset
-        cout << "  Training complete. Scoring network..." << endl;
-        double current_likelihood = calculate_observed_log_likelihood(
-                                        current_network, raw_data, name_to_index);
-        
-        cout << "  Restart " << restart + 1 << " Log-Likelihood: " << current_likelihood << endl;
-
-        // 5. Compare and save if it's the best one
-        if (current_likelihood > best_likelihood) {
-            cout << "  *** New best network found! ***" << endl;
-            best_likelihood = current_likelihood;
-            best_network = std::move(current_network); // Efficiently move
+    // --- Phase 1: Partition Data ---
+    cout << "\n--- Phase 1: Partitioning data ---" << endl;
+    vector<vector<string>> complete_rows;
+    vector<vector<string>> incomplete_rows;
+    
+    for (const auto& record : raw_data) {
+        bool is_complete = true;
+        for (const string& val : record) {
+            if (val == "?") {
+                is_complete = false;
+                break;
+            }
         }
-
-        // 6. Check time limit
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - main_start_time).count();
-        if (elapsed_ms > TIME_LIMIT_MS && restart < NUM_RESTARTS - 1) {
-            cout << "\n--- Time limit approaching (" << elapsed_ms / 1000.0
-                 << "s). Halting restarts. ---" << endl;
-            break;
+        if (is_complete) {
+            complete_rows.push_back(record);
+        } else {
+            incomplete_rows.push_back(record);
         }
     }
+    cout << "  Partitioned data: " << complete_rows.size() 
+         << " complete rows, " << incomplete_rows.size() 
+         << " incomplete rows." << endl;
+
+    // --- Phase 2: Create a High-Quality "Seed Network" ---
+    cout << "\n--- Phase 2: Building seed network from " << complete_rows.size() 
+         << " complete rows... ---" << endl;
+         
+    if (complete_rows.empty()) {
+        cerr << "  Warning: No complete rows found. Seeding with uniform probabilities." << endl;
+        // This is a fallback, but it's unlikely given the dataset
+        std::mt19937 rng(std::random_device{}()); // Need to include <random>
+        // We'll just have to use the original random init.
+        // Let's create a minimal uniform initializer.
+        for (int i = 0; i < BayesNet.netSize(); ++i) {
+            auto node_it = BayesNet.getNode(i);
+            int nvalues = node_it->get_nvalues();
+            long long cpt_size = node_it->get_CPT().size();
+            vector<float> uniform_cpt(cpt_size, 1.0f / nvalues);
+            node_it->set_CPT(uniform_cpt);
+        }
+    } else {
+        // This is the main path
+        learn_cpts_mle(BayesNet, complete_rows, name_to_index, SEED_PSEUDO_COUNT);
+    }
+    cout << "  Seed network built successfully." << endl;
+
+    // --- Phase 3: Refine with Full-Batch EM ---
+    cout << "\n--- Phase 3: Refining network with Full-Batch EM on all " 
+         << raw_data.size() << " rows... ---" << endl;
     
-    cout << "\n--- All restarts complete ---" << endl;
-    cout << "Best Log-Likelihood found: " << best_likelihood << endl;
+    learn_parameters_em(BayesNet, raw_data, name_to_index, 
+                        EM_MAX_ITERATIONS, EM_CONVERGENCE);
     
-    // Write the best network found across all restarts
-    write_network(best_network, "solved.bif");
+    cout << "\n--- Learning complete ---" << endl;
+    
+    // --- Write the final network ---
+    write_network(BayesNet, "solved.bif");
 
     return 0;
 }
