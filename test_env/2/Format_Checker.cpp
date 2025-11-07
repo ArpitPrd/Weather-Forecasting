@@ -101,7 +101,7 @@ int main() {
     cout << "=== FORMAT CHECKER ===" << endl;
 
     network base = read_network("hailfinder.bif");
-    network solved = read_network("solved_hailfinder.bif");
+    network solved = read_network("solved.bif");
     network gold = read_network("gold_hailfinder.bif");
 
     cout << "Network loaded successfully!" << endl;

@@ -19,7 +19,7 @@ using namespace std;
 
 std::chrono::steady_clock::time_point global_start_time;
 
-bool is_time_limit_exceeded(double limit_seconds = 105.0) {
+bool is_time_limit_exceeded(double limit_seconds = 115.0) {
     auto now = std::chrono::steady_clock::now();
     std::chrono::duration<double> elapsed_seconds = now - global_start_time;
     return elapsed_seconds.count() > limit_seconds;
@@ -554,16 +554,16 @@ vector<vector<string>> read_data(const string& filename) {
         if (line.empty() || line.front() == '[') continue;
 
         stringstream record_from_data_stream(line);
-        string word;
+        string token;
         vector<string> record_from_data;
 
-        while (getline(record_from_data_stream, word, ',')) {
-            word = trim_whitespace(word); 
+        while (getline(record_from_data_stream, token, ',')) {
+            token = trim_whitespace(token); 
             
-            if (word.size() >= 2 && word.front() == '"' && word.back() == '"') {
-                word = word.substr(1, word.size() - 2);
+            if (token.size() >= 2 && token.front() == '"' && token.back() == '"') {
+                token = token.substr(1, token.size() - 2);
             }
-            record_from_data.push_back(word);
+            record_from_data.push_back(token);
         }
         if (!record_from_data.empty()) {
             data.push_back(record_from_data);
@@ -613,78 +613,72 @@ pair<vector<string>, vector<int>> find_MB_of(const Graph_Node& node) {
     return {node.get_Parents(), node.get_children()};
 }
 
-vector<float> get_init_log_posterior_dist(const Graph_Node& missing_node, const network& bayesian_network_obj, const vector<string>& records_data, const map<string, int>& var_name_to_idx, const float epsilon) {
-    int no_of_values = missing_node.get_no_of_values();
-    vector<float> log_posterior(no_of_values, 0.0f); 
+vector<float> get_init_log_posterior_dist(const Graph_Node& missing_node, const network& bn, const vector<string>& record, const map<string, int>& name_to_index, const float epsilon) {
+    int nvalues = missing_node.get_no_of_values();
+    vector<float> log_posterior(nvalues, 0.0f); 
     const auto& parents = missing_node.get_Parents();
     const auto& cpt = missing_node.get_CPT();
 
     map<int, int> parent_val_indices;
     for (const string& pname : parents) {
-        int p_idx = var_name_to_idx.at(pname);
-        auto pnode_it = bayesian_network_obj.getNodeConst(p_idx);
-        parent_val_indices[p_idx] = get_value_index(*pnode_it, records_data[p_idx]);
+        int p_idx = name_to_index.at(pname);
+        auto pnode_it = bn.getNodeConst(p_idx);
+        parent_val_indices[p_idx] = get_value_index(*pnode_it, record[p_idx]);
     }
-    long long xm_pci = get_parent_idx(missing_node, bayesian_network_obj, var_name_to_idx, parent_val_indices);
+    long long xm_parent_config_index = get_parent_idx(missing_node, bn, name_to_index, parent_val_indices);
 
-    for (int k = 0; k < no_of_values; ++k) {
-        long long cpt_index = xm_pci * no_of_values + k;
-        float prob = (cpt_index < cpt.size()) ? cpt[cpt_index] : (1.0f / no_of_values);
-        if (prob < 0) prob = 1.0f / no_of_values;
+    for (int k = 0; k < nvalues; ++k) {
+        long long cpt_index = xm_parent_config_index * nvalues + k;
+        float prob = (cpt_index < cpt.size()) ? cpt[cpt_index] : (1.0f / nvalues);
+        if (prob < 0) prob = 1.0f / nvalues;
         log_posterior[k] += log(prob + epsilon);
     }
     
     return log_posterior;
 }
 
-void handle_child_idx(int child_idx, int missing_index, const network& bayesian_network_obj, const vector<string>& records_data, const map<string, int>& var_name_to_idx, vector<float>& log_posterior, const float epsilon) {
+void handle_child_idx(int child_idx, int missing_index, const network& bn, const vector<string>& record, const map<string, int>& name_to_index, vector<float>& log_posterior, const float epsilon) {
     
-    auto child_node_it = bayesian_network_obj.getNodeConst(child_idx);
+    auto child_node_it = bn.getNodeConst(child_idx);
     const auto& child_parents = child_node_it->get_Parents();
     const auto& child_cpt = child_node_it->get_CPT();
-    int child_no_of_values = child_node_it->get_no_of_values();
-    int no_values_missing = log_posterior.size(); 
+    int child_nvalues = child_node_it->get_no_of_values();
+    int nvalues_missing = log_posterior.size(); 
 
-    string child_val_str = records_data[child_idx];
-    int child_val_idx = get_value_index(*child_node_it, child_val_str);
-    if (child_val_idx == -1) return; 
+    string y_val_str = record[child_idx];
+    int y_val_idx = get_value_index(*child_node_it, y_val_str);
+    if (y_val_idx == -1) return; 
 
-    for (int k = 0; k < no_values_missing; ++k) { 
-        map<int, int> child_parent_val_indices;
+    for (int k = 0; k < nvalues_missing; ++k) { 
+        map<int, int> y_parent_val_indices;
         for (const string& ypname : child_parents) {
-            int childp_idx = var_name_to_idx.at(ypname);
+            int yp_idx = name_to_index.at(ypname);
             int val_idx = -1;
-            
-            if (true) {
-                int number_of_params_left = 0;
-            }
-            
-            if (childp_idx == missing_index) {
+            if (yp_idx == missing_index) {
                 val_idx = k;
-            } 
-            else {
-                auto child_node_iter = bayesian_network_obj.getNodeConst(childp_idx);
-                val_idx = get_value_index(*child_node_iter, records_data[childp_idx]);
+            } else {
+                auto ypnode_it = bn.getNodeConst(yp_idx);
+                val_idx = get_value_index(*ypnode_it, record[yp_idx]);
             }
-            child_parent_val_indices[childp_idx] = val_idx;
+            y_parent_val_indices[yp_idx] = val_idx;
         }
-        long long child_pci = get_parent_idx(*child_node_it, bayesian_network_obj, var_name_to_idx, child_parent_val_indices);
+        long long y_parent_config_index = get_parent_idx(*child_node_it, bn, name_to_index, y_parent_val_indices);
 
-        long long child_cpt_index = child_pci * child_no_of_values + child_val_idx;
-        float prob = (child_cpt_index < child_cpt.size()) ? child_cpt[child_cpt_index] : (1.0f / child_no_of_values);
-        if (prob < 0) prob = 1.0f / child_no_of_values;
+        long long child_cpt_index = y_parent_config_index * child_nvalues + y_val_idx;
+        float prob = (child_cpt_index < child_cpt.size()) ? child_cpt[child_cpt_index] : (1.0f / child_nvalues);
+        if (prob < 0) prob = 1.0f / child_nvalues;
         
         log_posterior[k] += log(prob + epsilon);
     }
 }
 
 pair<vector<float>, double> get_prob_dist_from_log_prob_dist(const vector<float>& log_posterior, const float epsilon) {
-    int no_of_values = log_posterior.size();
-    vector<float> final_posterior(no_of_values);
+    int nvalues = log_posterior.size();
+    vector<float> final_posterior(nvalues);
     float max_log_prob = *std::max_element(log_posterior.begin(), log_posterior.end());
     double sum_exp = 0.0;
 
-    for (int k = 0; k < no_of_values; ++k) {
+    for (int k = 0; k < nvalues; ++k) {
         double val = exp(log_posterior[k] - max_log_prob);
         final_posterior[k] = (float)val;
         sum_exp += val;
@@ -693,11 +687,11 @@ pair<vector<float>, double> get_prob_dist_from_log_prob_dist(const vector<float>
     double log_likelihood_of_record = max_log_prob + log(sum_exp + epsilon);
     
     if (sum_exp < epsilon) {
-        for (int k = 0; k < no_of_values; ++k) {
-            final_posterior[k] = 1.0f / no_of_values;
+        for (int k = 0; k < nvalues; ++k) {
+            final_posterior[k] = 1.0f / nvalues;
         }
     } else {
-        for (int k = 0; k < no_of_values; ++k) {
+        for (int k = 0; k < nvalues; ++k) {
             final_posterior[k] /= (float)sum_exp;
         }
     }
@@ -705,197 +699,97 @@ pair<vector<float>, double> get_prob_dist_from_log_prob_dist(const vector<float>
     return {final_posterior, log_likelihood_of_record};
 }
 
-pair<vector<float>, double> get_posterior_dist_for_missing_var(const network& bayesian_network_obj, const vector<string>& records_data, int missing_index, const map<string, int>& var_name_to_idx) {
+pair<vector<float>, double> get_posterior_dist_for_missing_var(const network& bn, const vector<string>& record, int missing_index, const map<string, int>& name_to_index) {
     
-    auto missing_node_it = bayesian_network_obj.getNodeConst(missing_index);
+    auto missing_node_it = bn.getNodeConst(missing_index);
     const float epsilon = 1e-9f; 
 
-    vector<float> log_posterior = get_init_log_posterior_dist(*missing_node_it, bayesian_network_obj, records_data, var_name_to_idx, epsilon);
+    vector<float> log_posterior = get_init_log_posterior_dist(*missing_node_it, bn, record, name_to_index, epsilon);
 
     const auto& children_indices = missing_node_it->get_children();
     for (int child_idx : children_indices) {
-        handle_child_idx(child_idx, missing_index, bayesian_network_obj, records_data, var_name_to_idx, log_posterior, epsilon);
+        handle_child_idx(child_idx, missing_index, bn, record, name_to_index, log_posterior, epsilon);
     }
 
     return get_prob_dist_from_log_prob_dist(log_posterior, epsilon);
 }
 
+void initialize_cpts_randomly(network& bayesian_network_obj, const map<string, int>& var_name_to_id, mt19937& rng) {
+    
+    uniform_real_distribution<float> dist(0.0, 1.0);
 
-void normalize_cpt(long long parent_config_idx, int no_of_values, float remaining_prob, float sum, const vector<bool>& cpt_mask, vector<float>& new_cpt) {
-    for (int k = 0; k < no_of_values; ++k) {
-        long long cpt_index = parent_config_idx * no_of_values + k;
-        if (!cpt_mask[cpt_index]) {
-            new_cpt[cpt_index] = (new_cpt[cpt_index] / sum) * remaining_prob;
-        }
-    }
-}
+    for (int i = 0; i < bayesian_network_obj.netSize(); ++i) {
+        auto iterator_for_node = bayesian_network_obj.getNode(i);
+        int no_of_values = iterator_for_node->get_no_of_values();
+        const auto& old_cpt = iterator_for_node->get_CPT(); 
+        const auto& cpt_mask = iterator_for_node->get_CPT_mask();
 
-void make_adjustment_to_random_cpt(long long parent_config_idx, int no_of_values, float sum, float fixed_prob_sum, int non_fixed_count, const vector<bool>& cpt_mask, vector<float>& new_cpt) {
-
-    if (non_fixed_count == 0) {
-        return;
-    }
-
-    if (sum > 1e-9) {
-        float remaining_prob = 1.0f - fixed_prob_sum;
+        long long cpt_size = old_cpt.size();
+        if (cpt_size == 0) continue;
         
-        if (remaining_prob <= 0) {
+        vector<float> new_cpt = old_cpt;
+        long long parent_configs = cpt_size / no_of_values;
+
+        for (long long j = 0; j < parent_configs; ++j) {
+            
+            float sum = 0.0f;
+            float fixed_prob_sum = 0.0f;
+            int non_fixed_count = 0;
+
             for (int k = 0; k < no_of_values; ++k) {
-                long long cpt_index = parent_config_idx * no_of_values + k;
-                if (!cpt_mask[cpt_index]) {
-                    new_cpt[cpt_index] = 1.0f / non_fixed_count;
+                long long cpt_index = j * no_of_values + k;
+                if (cpt_mask[cpt_index]) {
+                    fixed_prob_sum += new_cpt[cpt_index];
+                } else {
+                    float rand_val = dist(rng) + 1e-6f;
+                    new_cpt[cpt_index] = rand_val;
+                    sum += rand_val;
+                    non_fixed_count++;
                 }
             }
-        } 
-        else {
-            normalize_cpt(parent_config_idx, no_of_values, remaining_prob, sum, cpt_mask, new_cpt);
-        }
-    } 
-    else {
-         float uniform_prob = (1.0f - fixed_prob_sum) / non_fixed_count;
-         if (uniform_prob < 0) uniform_prob = 0;
-         
-         for (int k = 0; k < no_of_values; ++k) {
-            long long cpt_index = parent_config_idx * no_of_values + k;
-            if (!cpt_mask[cpt_index]) {
-                new_cpt[cpt_index] = uniform_prob;
+
+            if (non_fixed_count == 0) {
+                continue;
             }
-        }
-    }
-}
 
-void handle_random_cpt_for_parent_config_id(long long parent_config_idx, int no_of_values, const vector<bool>& cpt_mask, vector<float>& new_cpt, std::mt19937& rng, std::uniform_real_distribution<float>& dist) {
-    
-    float sum = 0.0f;
-    float fixed_prob_sum = 0.0f;
-    int non_fixed_count = 0;
-
-    for (int k = 0; k < no_of_values; ++k) {
-        long long cpt_index = parent_config_idx * no_of_values + k;
-        if (cpt_mask[cpt_index]) {
-            fixed_prob_sum += new_cpt[cpt_index];
-        } 
-        else {
-            float rand_val = dist(rng) + 1e-6f;
-            new_cpt[cpt_index] = rand_val;
-            sum += rand_val;
-            non_fixed_count++;
-        }
-    }
-
-    make_adjustment_to_random_cpt(parent_config_idx, no_of_values, sum, fixed_prob_sum, non_fixed_count, cpt_mask, new_cpt);
-}
-
-void handle_random_cpt_init_for_node(Graph_Node* node_it, std::mt19937& rng, std::uniform_real_distribution<float>& dist) {
-    
-    int no_of_values = node_it->get_no_of_values();
-    const auto& old_cpt = node_it->get_CPT(); 
-    const auto& cpt_mask = node_it->get_CPT_mask();
-
-    long long cpt_size = old_cpt.size();
-    if (cpt_size == 0) return;
-    
-    vector<float> new_cpt = old_cpt; 
-    long long parent_configs = cpt_size / no_of_values;
-
-    for (long long j = 0; j < parent_configs; ++j) {
-        handle_random_cpt_for_parent_config_id(j, no_of_values, cpt_mask, new_cpt, rng, dist);
-    }
-    
-    node_it->set_CPT(new_cpt);
-}
-
-void initialize_cpts_randomly(network& bayesian_network_obj, const map<string, int>& var_name_to_id, std::mt19937& rng) {
-    
-    std::uniform_real_distribution<float> dist(0.0, 1.0);
-
-    for (int i = 0; i < bayesian_network_obj.netSize(); ++i) {
-        auto node_it = bayesian_network_obj.getNode(i);
-        handle_random_cpt_init_for_node(&(*node_it), rng, dist);
-    }
-}
-
-
-map<int, vector<float>> get_child_counts_for(const network& bayesian_network_obj, const vector<vector<string>>& records_data, const map<string, int>& var_name_to_idx, float alpha) {
-    
-    map<int, vector<float>> nums;
-    for (int i = 0; i < bayesian_network_obj.netSize(); ++i) {
-        nums[i] = vector<float>(bayesian_network_obj.getNodeConst(i)->get_CPT().size(), alpha);
-    }
-    
-    for (const auto& record : records_data) {
-        if (record.size() != bayesian_network_obj.netSize()) continue; 
-
-        for (int i = 0; i < bayesian_network_obj.netSize(); ++i) {
-            auto node_it = bayesian_network_obj.getNodeConst(i);
-            int c_val_idx = get_value_index(*node_it, record[i]);
-            if (c_val_idx == -1) continue; 
-
-            map<int, int> parent_val_indices;
-            bool record_valid = true;
-            for (const auto& pname : node_it->get_Parents()) {
-                int p_idx = var_name_to_idx.at(pname);
-                auto pnode_it = bayesian_network_obj.getNodeConst(p_idx);
-                int val_idx = get_value_index(*pnode_it, record[p_idx]);
-                if (val_idx == -1) { 
-                    record_valid = false;
-                    break;
+            if (sum > 1e-9) {
+                float remaining_prob = 1.0f - fixed_prob_sum;
+                
+                if (remaining_prob <= 0) { 
+                    for (int k = 0; k < no_of_values; ++k) {
+                        long long cpt_index = j * no_of_values + k;
+                        if (!cpt_mask[cpt_index]) {
+                            new_cpt[cpt_index] = 1.0f / non_fixed_count;
+                        }
+                    }
+                } else {
+                    for (int k = 0; k < no_of_values; ++k) {
+                        long long cpt_index = j * no_of_values + k;
+                        if (!cpt_mask[cpt_index]) {
+                            new_cpt[cpt_index] = (new_cpt[cpt_index] / sum) * remaining_prob;
+                        }
+                    }
                 }
-                parent_val_indices[p_idx] = val_idx;
-            }
-            if (!record_valid) continue;
-            
-            long long cpt_index = get_cpt_entry_idx(*node_it, bayesian_network_obj, var_name_to_idx, c_val_idx, parent_val_indices);
-            if (cpt_index < nums[i].size()) {
-                nums[i][cpt_index]++;
-            }
-        }
-    }
-    return nums;
-}
-
-map<int, vector<float>> get_parent_counts_for(const network& bayesian_network_obj, const vector<vector<string>>& records_data, const map<string, int>& var_name_to_idx, float alpha) {
-    
-    map<int, vector<float>> dens;
-    for (int i = 0; i < bayesian_network_obj.netSize(); ++i) {
-        auto node_it = bayesian_network_obj.getNodeConst(i);
-        long long denom_size = node_it->get_CPT().size() / node_it->get_no_of_values();
-        dens[i] = vector<float>(denom_size, node_it->get_no_of_values() * alpha);
-    }
-    
-    for (const auto& record : records_data) {
-        if (record.size() != bayesian_network_obj.netSize()) continue; 
-
-        for (int i = 0; i < bayesian_network_obj.netSize(); ++i) {
-            auto node_it = bayesian_network_obj.getNodeConst(i);
-            if (get_value_index(*node_it, record[i]) == -1) continue;
-
-            map<int, int> parent_val_indices;
-            bool record_valid = true;
-            for (const auto& pname : node_it->get_Parents()) {
-                int p_idx = var_name_to_idx.at(pname);
-                auto pnode_it = bayesian_network_obj.getNodeConst(p_idx);
-                int val_idx = get_value_index(*pnode_it, record[p_idx]);
-                if (val_idx == -1) { 
-                    record_valid = false;
-                    break;
+            } else {
+                 float uniform_prob = (1.0f - fixed_prob_sum) / non_fixed_count;
+                 if (uniform_prob < 0) uniform_prob = 0;
+                 
+                 for (int k = 0; k < no_of_values; ++k) {
+                    long long cpt_index = j * no_of_values + k;
+                    if (!cpt_mask[cpt_index]) {
+                        new_cpt[cpt_index] = uniform_prob;
+                    }
                 }
-                parent_val_indices[p_idx] = val_idx;
-            }
-            if (!record_valid) continue;
-            
-            long long parent_config_index = get_parent_idx(*node_it, bayesian_network_obj, var_name_to_idx, parent_val_indices);
-            if (parent_config_index < dens[i].size()) {
-                dens[i][parent_config_index]++;
             }
         }
+        iterator_for_node->set_CPT(new_cpt);
     }
-    return dens;
 }
 
-pair<map<int, vector<float>>, map<int, vector<float>>> init_num_den_for_counts(const network& bayesian_network_obj, float alpha) {
-    map<int, vector<float>> nums;
-    map<int, vector<float>> dens;
+pair<map<int, vector<float>>, map<int, vector<float>>> get_counts_for( const network& bayesian_network_obj, const vector<vector<string>>& record_from_datas, const map<string, int>& var_name_to_id, float alpha) {
+    
+    map<int, vector<float>> numerators;
+    map<int, vector<float>> denominators;
 
     for (int i = 0; i < bayesian_network_obj.netSize(); ++i) {
         auto iterator_for_node = bayesian_network_obj.getNodeConst(i);
@@ -903,95 +797,69 @@ pair<map<int, vector<float>>, map<int, vector<float>>> init_num_den_for_counts(c
         long long cpt_size = iterator_for_node->get_CPT().size();
         if (cpt_size == 0) continue;
 
-        nums[i] = vector<float>(cpt_size, alpha);
-        dens[i] = vector<float>(cpt_size / num_child_values, (float)num_child_values * alpha);
+        numerators[i] = vector<float>(cpt_size, alpha);
+        denominators[i] = vector<float>(cpt_size / num_child_values, (float)num_child_values * alpha);
     }
-    return {nums, dens};
-}
+    
+    for (const auto& record_from_data : record_from_datas) {
+        if (record_from_data.size() != bayesian_network_obj.netSize()) continue;
+            
+        for (int i = 0; i < bayesian_network_obj.netSize(); ++i) {
+            auto iterator_for_node = bayesian_network_obj.getNodeConst(i);
+            const auto& parents = iterator_for_node->get_Parents();
+            int num_child_values = iterator_for_node->get_no_of_values();
 
-pair<map<int, int>, bool> update_parent_val_indices_for_count(const Graph_Node& node, const network& bayesian_network_obj, const vector<string>& record_from_data, const map<string, int>& var_name_to_id) {
-    map<int, int> parent_val_indices;
-    bool record_from_data_valid = true;
-    const auto& parents = node.get_Parents();
+            map<int, int> parent_val_indices;
+            bool record_from_data_valid = true;
+            
+            for (const auto& pname : parents) {
+                int p_idx = var_name_to_id.at(pname);
+                auto piterator_for_node = bayesian_network_obj.getNodeConst(p_idx);
+                int val_idx = get_value_index(*piterator_for_node, record_from_data[p_idx]);
+                if (val_idx == -1) { 
+                    record_from_data_valid = false;
+                    break;
+                }
+                parent_val_indices[p_idx] = val_idx;
+            }
+            if (!record_from_data_valid) continue;
 
-    for (const auto& pname : parents) {
-        int p_idx = var_name_to_id.at(pname);
-        auto piterator_for_node = bayesian_network_obj.getNodeConst(p_idx);
-        int val_idx = get_value_index(*piterator_for_node, record_from_data[p_idx]);
-        if (val_idx == -1) { 
-            record_from_data_valid = false;
-            break;
+            int c_val_idx = get_value_index(*iterator_for_node, record_from_data[i]);
+            if (c_val_idx == -1) continue; 
+            
+            long long pci = get_parent_idx(*iterator_for_node, bayesian_network_obj, var_name_to_id, parent_val_indices);
+            long long cpt_index = pci * num_child_values + c_val_idx;
+            
+            if (cpt_index >= numerators[i].size() || pci >= denominators[i].size()) {
+                 cerr << "FATAL (get_counts_for): Index out of bounds." << endl;
+                 continue;
+            }
+            
+            numerators[i][cpt_index]++;
+            denominators[i][pci]++;
         }
-        parent_val_indices[p_idx] = val_idx;
     }
-    return {parent_val_indices, record_from_data_valid};
+    return {numerators, denominators};
 }
 
-void handle_record_for_count(const vector<string>& record_from_data, const network& bayesian_network_obj, const map<string, int>& var_name_to_id, map<int, vector<float>>& nums, map<int, vector<float>>& dens) {
-    if (record_from_data.size() != bayesian_network_obj.netSize()) return;
-        
-    for (int i = 0; i < bayesian_network_obj.netSize(); ++i) {
-        auto iterator_for_node = bayesian_network_obj.getNodeConst(i);
-        int num_child_values = iterator_for_node->get_no_of_values();
-
-        auto parent_info = update_parent_val_indices_for_count(
-            *iterator_for_node, bayesian_network_obj, record_from_data, var_name_to_id);
-        
-        map<int, int> parent_val_indices = parent_info.first;
-        bool record_from_data_valid = parent_info.second;
-
-        if (!record_from_data_valid) continue;
-
-        int c_val_idx = get_value_index(*iterator_for_node, record_from_data[i]);
-        if (c_val_idx == -1) continue; 
-        
-        long long pci = get_parent_idx(*iterator_for_node, bayesian_network_obj, var_name_to_id, parent_val_indices);
-        long long cpt_index = pci * num_child_values + c_val_idx;
-        
-        if (cpt_index >= nums[i].size() || pci >= dens[i].size()) {
-             cerr << "FATAL (handle_record_for_count): Index out of bounds." << endl;
-             continue;
-        }
-        
-        nums[i][cpt_index]++;
-        dens[i][pci]++;
-    }
-}
-
-
-pair<map<int, vector<float>>, map<int, vector<float>>> get_counts_for(const network& bayesian_network_obj, const vector<vector<string>>& records_data, const map<string, int>& var_name_to_idx, float alpha) {
+vector<float> compute_cpt_from_num_den(const vector<float>& numerators, const vector<float>& denominators, int no_of_values, float alpha, const vector<float>& old_cpt, const vector<bool>& cpt_mask) {
     
-    auto counts = init_num_den_for_counts(bayesian_network_obj, alpha);
-    map<int, vector<float>> nums = counts.first;
-    map<int, vector<float>> dens = counts.second;
-
-    for (const auto& record : records_data) {
-        handle_record_for_count(record, bayesian_network_obj, var_name_to_idx, nums, dens);
-    }
-    
-    return {nums, dens};
-}
-
-vector<float> compute_cpt_from_num_den(const vector<float>& nums, const vector<float>& dens, int no_of_values, float alpha, const vector<float>& old_cpt, const vector<bool>& cpt_mask) {
-    
-    long long cpt_size = nums.size();
+    long long cpt_size = numerators.size();
     vector<float> new_cpt(cpt_size);
     
-    for (long long j = 0; j < dens.size(); ++j) {
-        float total_count = dens[j];
+    for (long long j = 0; j < denominators.size(); ++j) {
+        float total_count = denominators[j];
         
         for (int k = 0; k < no_of_values; ++k) {
             long long cpt_index = j * no_of_values + k;
             
             if (cpt_index < cpt_mask.size() && cpt_mask[cpt_index]) {
                 new_cpt[cpt_index] = old_cpt[cpt_index];
-            } 
-            else {
+            } else {
                 if (total_count < 1e-9) { 
                     new_cpt[cpt_index] = 1.0f / no_of_values; 
-                } 
-                else {
-                    new_cpt[cpt_index] = nums[cpt_index] / total_count;
+                } else {
+                    new_cpt[cpt_index] = numerators[cpt_index] / total_count;
                 }
             }
         }
@@ -999,7 +867,7 @@ vector<float> compute_cpt_from_num_den(const vector<float>& nums, const vector<f
     return new_cpt;
 }
 
-float update_cpt_in_bayesian_network_obj(network& bayesian_network_obj, const map<int, vector<float>>& nums, const map<int, vector<float>>& dens, float alpha) {
+float update_cpt_in_bayesian_network_obj(network& bayesian_network_obj, const map<int, vector<float>>& numerators, const map<int, vector<float>>& denominators, float alpha) {
     
     float max_change = 0.0f;
 
@@ -1009,12 +877,12 @@ float update_cpt_in_bayesian_network_obj(network& bayesian_network_obj, const ma
         const auto& old_cpt = iterator_for_node->get_CPT();
         const auto& cpt_mask = iterator_for_node->get_CPT_mask();
 
-        if (nums.count(i) == 0 || dens.count(i) == 0) {
+        if (numerators.count(i) == 0 || denominators.count(i) == 0) {
             continue; 
         }
 
-        const auto& node_numerators = nums.at(i);
-        const auto& node_denominators = dens.at(i);
+        const auto& node_numerators = numerators.at(i);
+        const auto& node_denominators = denominators.at(i);
 
         vector<float> new_cpt = compute_cpt_from_num_den(node_numerators, node_denominators, no_of_values, alpha, old_cpt, cpt_mask);
 
@@ -1041,180 +909,176 @@ void update_cpts_mle_from_complete_data(network& bayesian_network_obj, const vec
     update_cpt_in_bayesian_network_obj(bayesian_network_obj, counts.first, counts.second, alpha);
 }
 
-pair<map<int, vector<float>>, map<int, vector<float>>> initialize_num_den(const network& bayesian_network_obj) {
-    int n_nodes = bayesian_network_obj.netSize();
-    map<int, vector<float>> enums;
-    map<int, vector<float>> edens;
+pair<map<int, vector<float>>, map<int, vector<float>>> initialize_num_den(const network& bn) {
+    int n_nodes = bn.netSize();
+    map<int, vector<float>> expected_numerators;
+    map<int, vector<float>> expected_denominators;
     
     for (int i = 0; i < n_nodes; ++i) {
-        auto node_it = bayesian_network_obj.getNodeConst(i);
-        int no_of_values = node_it->get_no_of_values();
+        auto node_it = bn.getNodeConst(i);
+        int nvalues = node_it->get_no_of_values();
         long long cpt_size = node_it->get_CPT().size();
         
-        long long denom_size = cpt_size / no_of_values;
-        enums[i] = vector<float>(cpt_size, 0.0f);
-        edens[i] = vector<float>(denom_size, 0.0f);
+        long long denom_size = cpt_size / nvalues;
+        expected_numerators[i] = vector<float>(cpt_size, 0.0f);
+        expected_denominators[i] = vector<float>(denom_size, 0.0f);
     }
-    return {enums, edens};
+    return {expected_numerators, expected_denominators};
 }
 
-int get_missing_var_id(const vector<string>& records_data) {
-    for(int j = 0; j < records_data.size(); ++j) {
-        if(records_data[j] == "?") {
+int get_missing_var_id(const vector<string>& record) {
+    for(int j = 0; j < record.size(); ++j) {
+        if(record[j] == "?") {
             return j;
         }
     }
     return -1;
 }
 
-void handle_case_of_complete_data(const network& bayesian_network_obj, const vector<string>& records_data, const map<string, int>& var_name_to_idx, map<int, vector<float>>& nums, map<int, vector<float>>& dens)  {
-    int n_nodes = bayesian_network_obj.netSize();
+void handle_case_of_complete_data(const network& bn, const vector<string>& record, const map<string, int>& name_to_index, map<int, vector<float>>& numerators, map<int, vector<float>>& denominators)  {
+    int n_nodes = bn.netSize();
     for (int i = 0; i < n_nodes; ++i) {
-        auto node_it = bayesian_network_obj.getNodeConst(i);
-        int c_val_idx = get_value_index(*node_it, records_data[i]);
+        auto node_it = bn.getNodeConst(i);
+        int c_val_idx = get_value_index(*node_it, record[i]);
         if(c_val_idx == -1) continue;
         
         map<int, int> parent_val_indices;
         for(const string& pname : node_it->get_Parents()) {
-            int p_idx = var_name_to_idx.at(pname);
-            auto pnode_it = bayesian_network_obj.getNodeConst(p_idx);
-            parent_val_indices[p_idx] = get_value_index(*pnode_it, records_data[p_idx]);
+            int p_idx = name_to_index.at(pname);
+            auto pnode_it = bn.getNodeConst(p_idx);
+            parent_val_indices[p_idx] = get_value_index(*pnode_it, record[p_idx]);
         }
 
-        long long pci = get_parent_idx(*node_it, bayesian_network_obj, var_name_to_idx, parent_val_indices);
-        long long num_index = get_cpt_entry_idx(*node_it, bayesian_network_obj, var_name_to_idx, c_val_idx, parent_val_indices);
+        long long parent_config_index = get_parent_idx(*node_it, bn, name_to_index, parent_val_indices);
+        long long num_index = get_cpt_entry_idx(*node_it, bn, name_to_index, c_val_idx, parent_val_indices);
         
-        if (num_index < nums[i].size() && pci < dens[i].size()) {
-            nums[i][num_index] += 1.0f;
-            dens[i][pci] += 1.0f;
+        if (num_index < numerators[i].size() && parent_config_index < denominators[i].size()) {
+            numerators[i][num_index] += 1.0f;
+            denominators[i][parent_config_index] += 1.0f;
         }
     }
 }
 
-void handle_not_missing_node_not_child_of_missing_node(int node_idx, const network& bayesian_network_obj, const vector<string>& records_data, const map<string, int>& var_name_to_idx, map<int, vector<float>>& nums, map<int, vector<float>>& dens) {
-    auto node_it = bayesian_network_obj.getNodeConst(node_idx);
-    int c_val_idx = get_value_index(*node_it, records_data[node_idx]);
+void handle_not_missing_node_not_child_of_missing_node(int node_idx, const network& bn, const vector<string>& record, const map<string, int>& name_to_index, map<int, vector<float>>& numerators, map<int, vector<float>>& denominators) {
+    auto node_it = bn.getNodeConst(node_idx);
+    int c_val_idx = get_value_index(*node_it, record[node_idx]);
     if (c_val_idx == -1) return;
 
     map<int, int> parent_val_indices;
     for(const string& pname : node_it->get_Parents()) {
-        int p_idx = var_name_to_idx.at(pname);
-        auto pnode_it = bayesian_network_obj.getNodeConst(p_idx);
-        parent_val_indices[p_idx] = get_value_index(*pnode_it, records_data[p_idx]);
+        int p_idx = name_to_index.at(pname);
+        auto pnode_it = bn.getNodeConst(p_idx);
+        parent_val_indices[p_idx] = get_value_index(*pnode_it, record[p_idx]);
     }
     
-    long long pci = get_parent_idx(*node_it, bayesian_network_obj, var_name_to_idx, parent_val_indices);
-    long long num_index = get_cpt_entry_idx(*node_it, bayesian_network_obj, var_name_to_idx, c_val_idx, parent_val_indices);
+    long long parent_config_index = get_parent_idx(*node_it, bn, name_to_index, parent_val_indices);
+    long long num_index = get_cpt_entry_idx(*node_it, bn, name_to_index, c_val_idx, parent_val_indices);
 
-    if (num_index < nums[node_idx].size() && pci < dens[node_idx].size()) {
-        nums[node_idx][num_index] += 1.0f;
-        dens[node_idx][pci] += 1.0f;
+    if (num_index < numerators[node_idx].size() && parent_config_index < denominators[node_idx].size()) {
+        numerators[node_idx][num_index] += 1.0f;
+        denominators[node_idx][parent_config_index] += 1.0f;
     }
 }
 
-void handle_not_child_of_missing_node(int node_idx, int missing_index, const network& bayesian_network_obj, const vector<string>& records_data, const vector<float>& posterior_dist, const map<string, int>& var_name_to_idx, map<int, vector<float>>& nums, map<int, vector<float>>& dens) {
-    auto node_it = bayesian_network_obj.getNodeConst(node_idx);
-    int no_of_values = node_it->get_no_of_values();
+void handle_not_child_of_missing_node(int node_idx, int missing_index, const network& bn, const vector<string>& record, const vector<float>& posterior, const map<string, int>& name_to_index, map<int, vector<float>>& numerators, map<int, vector<float>>& denominators) {
+    auto node_it = bn.getNodeConst(node_idx);
+    int nvalues = node_it->get_no_of_values();
     map<int, int> parent_val_indices;
     for(const string& pname : node_it->get_Parents()) {
-        int p_idx = var_name_to_idx.at(pname);
-        auto pnode_it = bayesian_network_obj.getNodeConst(p_idx);
-        parent_val_indices[p_idx] = get_value_index(*pnode_it, records_data[p_idx]);
+        int p_idx = name_to_index.at(pname);
+        auto pnode_it = bn.getNodeConst(p_idx);
+        parent_val_indices[p_idx] = get_value_index(*pnode_it, record[p_idx]);
     }
-    long long pci = get_parent_idx(*node_it, bayesian_network_obj, var_name_to_idx, parent_val_indices);
+    long long parent_config_index = get_parent_idx(*node_it, bn, name_to_index, parent_val_indices);
 
-    if (pci < dens[node_idx].size()) {
-        for (int k = 0; k < no_of_values; ++k) {
-            long long num_index = pci * no_of_values + k;
-            if (num_index < nums[node_idx].size()) {
-                nums[node_idx][num_index] += posterior_dist[k];
-                dens[node_idx][pci] += posterior_dist[k];
+    if (parent_config_index < denominators[node_idx].size()) {
+        for (int k = 0; k < nvalues; ++k) {
+            long long num_index = parent_config_index * nvalues + k;
+            if (num_index < numerators[node_idx].size()) {
+                numerators[node_idx][num_index] += posterior[k];
+                denominators[node_idx][parent_config_index] += posterior[k];
             }
         }
     }
 }
 
-void handle_not_missing_node(int node_idx, int missing_index, const network& bayesian_network_obj, const vector<string>& records_data, const vector<float>& posterior_dist, const map<string, int>& var_name_to_idx, map<int, vector<float>>& nums, map<int, vector<float>>& dens) {
-    auto node_it = bayesian_network_obj.getNodeConst(node_idx);
+void handle_not_missing_node(int node_idx, int missing_index, const network& bn, const vector<string>& record, const vector<float>& posterior, const map<string, int>& name_to_index, map<int, vector<float>>& numerators, map<int, vector<float>>& denominators) {
+    auto node_it = bn.getNodeConst(node_idx);
     const auto& parents = node_it->get_Parents();
-    int no_of_values = node_it->get_no_of_values();
-    int xm_no_of_values = posterior_dist.size();
+    int nvalues = node_it->get_no_of_values();
+    int xm_nvalues = posterior.size();
 
-    int child_val_idx = get_value_index(*node_it, records_data[node_idx]);
-    if (child_val_idx == -1) return;
+    int y_val_idx = get_value_index(*node_it, record[node_idx]);
+    if (y_val_idx == -1) return;
     
-    for (int k = 0; k < xm_no_of_values; ++k) {
+    for (int k = 0; k < xm_nvalues; ++k) {
         map<int, int> parent_val_indices;
         for(const string& pname : parents) {
-            int p_idx = var_name_to_idx.at(pname);
+            int p_idx = name_to_index.at(pname);
             if (p_idx == missing_index) {
                 parent_val_indices[p_idx] = k;
-            } 
-            else {
-                auto pnode_it = bayesian_network_obj.getNodeConst(p_idx);
-                parent_val_indices[p_idx] = get_value_index(*pnode_it, records_data[p_idx]);
+            } else {
+                auto pnode_it = bn.getNodeConst(p_idx);
+                parent_val_indices[p_idx] = get_value_index(*pnode_it, record[p_idx]);
             }
         }
-        long long pci = get_parent_idx(*node_it, bayesian_network_obj, var_name_to_idx, parent_val_indices);
-        long long num_index = pci * no_of_values + child_val_idx;
+        long long parent_config_index = get_parent_idx(*node_it, bn, name_to_index, parent_val_indices);
+        long long num_index = parent_config_index * nvalues + y_val_idx;
         
-        if (num_index < nums[node_idx].size() && pci < dens[node_idx].size()) {
-            nums[node_idx][num_index] += posterior_dist[k];
-            dens[node_idx][pci] += posterior_dist[k];
-            if (true) {
-                // I will fill this condition later
-            }
+        if (num_index < numerators[node_idx].size() && parent_config_index < denominators[node_idx].size()) {
+            numerators[node_idx][num_index] += posterior[k];
+            denominators[node_idx][parent_config_index] += posterior[k];
         }
     }
 }
 
 
-void handle_case_of_incomplete_data(const network& bayesian_network_obj, const vector<string>& records_data, int missing_index, const map<string, int>& var_name_to_idx, map<int, vector<float>>& nums, map<int, vector<float>>& dens) {
-    vector<float> posterior_dist = get_posterior_dist_for_missing_var(bayesian_network_obj, records_data, missing_index, var_name_to_idx).first;
+void handle_case_of_incomplete_data(const network& bn, const vector<string>& record, int missing_index, const map<string, int>& name_to_index, map<int, vector<float>>& numerators, map<int, vector<float>>& denominators) {
+    vector<float> posterior = get_posterior_dist_for_missing_var(bn, record, missing_index, name_to_index).first;
 
-    int n_nodes = bayesian_network_obj.netSize();
+    int n_nodes = bn.netSize();
     for (int i = 0; i < n_nodes; ++i) {
-        auto node_it = bayesian_network_obj.getNodeConst(i);
+        auto node_it = bn.getNodeConst(i);
         const auto& parents = node_it->get_Parents();
         
         bool is_missing_node = (i == missing_index);
         bool is_child_of_missing = false;
         for (const auto& pname : parents) {
-            if (var_name_to_idx.at(pname) == missing_index) {
+            if (name_to_index.at(pname) == missing_index) {
                 is_child_of_missing = true;
                 break;
             }
         }
 
         if (!is_missing_node && !is_child_of_missing) {
-            handle_not_missing_node_not_child_of_missing_node(i, bayesian_network_obj, records_data, var_name_to_idx, nums, dens);
+            handle_not_missing_node_not_child_of_missing_node(i, bn, record, name_to_index, numerators, denominators);
         } 
         else if (is_missing_node) {
-            handle_not_child_of_missing_node(i, missing_index, bayesian_network_obj, records_data, posterior_dist, var_name_to_idx, nums, dens);
+            handle_not_child_of_missing_node(i, missing_index, bn, record, posterior, name_to_index, numerators, denominators);
         } 
         else if (is_child_of_missing) {
-            handle_not_missing_node(i, missing_index, bayesian_network_obj, records_data, posterior_dist, var_name_to_idx, nums, dens);
+            handle_not_missing_node(i, missing_index, bn, record, posterior, name_to_index, numerators, denominators);
         }
     }
 }
 
 
-pair<map<int, vector<float>>, map<int, vector<float>>> perform_E_step(const network& bayesian_network_obj, const vector<vector<string>>& raw_data, const map<string, int>& var_name_to_idx) {
+pair<map<int, vector<float>>, map<int, vector<float>>> perform_E_step(const network& bn, const vector<vector<string>>& raw_data, const map<string, int>& name_to_index) {
     
-    auto counts = initialize_num_den(bayesian_network_obj);
-    map<int, vector<float>> enums = counts.first;
-    map<int, vector<float>> edens = counts.second;
+    auto counts = initialize_num_den(bn);
+    map<int, vector<float>> expected_numerators = counts.first;
+    map<int, vector<float>> expected_denominators = counts.second;
 
-    for (const auto& records_data : raw_data) {
-        int missing_index = get_missing_var_id(records_data);
+    for (const auto& record : raw_data) {
+        int missing_index = get_missing_var_id(record);
 
         if (missing_index == -1) {
-            handle_case_of_complete_data(bayesian_network_obj, records_data, var_name_to_idx, enums, edens);
+            handle_case_of_complete_data(bn, record, name_to_index, expected_numerators, expected_denominators);
         } else {
-            handle_case_of_incomplete_data(bayesian_network_obj, records_data, missing_index, var_name_to_idx, enums, edens);
+            handle_case_of_incomplete_data(bn, record, missing_index, name_to_index, expected_numerators, expected_denominators);
         }
     }
-    return {enums, edens};
+    return {expected_numerators, expected_denominators};
 }
 
 float perform_M_step(network& bayesian_network_obj, const map<int, vector<float>>& enums, const map<int, vector<float>>& edens, float alpha) {
@@ -1248,6 +1112,7 @@ void em_call(network& bayesian_network_obj, const vector<vector<string>>& raw_da
     for (int iter = 0; iter < N_iterations; ++iter) {
         
         if (is_time_limit_exceeded()) {
+            cout << "  ... TIME LIMIT EXCEEDED. Exiting EM loop." << endl;
             break;
         }
         
@@ -1255,10 +1120,10 @@ void em_call(network& bayesian_network_obj, const vector<vector<string>>& raw_da
 
         float max_change = perform_M_step(bayesian_network_obj, expected_counts.first, expected_counts.second, alpha);
 
-        // cout << "  ... Iteration " << iter + 1 << " complete. Max CPT change: " << max_change << endl;
+        cout << "  ... Iteration " << iter + 1 << " complete. Max CPT change: " << max_change << endl;
 
         if (max_change < convergence_threshold) {
-            // cout << "  ... Converged after " << iter + 1 << " iterations." << endl;
+            cout << "  ... Converged after " << iter + 1 << " iterations." << endl;
             break;
         }
 
@@ -1271,38 +1136,38 @@ int main(int argc, char* argv[]) {
     global_start_time = chrono::steady_clock::now();
     
     if (argc != 3) {
-        // cout << "Usage: " << argv[0] << " <hailfinder_file> <data_file>" << endl;
+        cout << "Usage: " << argv[0] << " <hailfinder_file> <data_file>" << endl;
     }
 
     string hailfinder_file = argv[1];
     string data_file = argv[2];
 
-    const float initial_alpha = 0.5f;
-    const int no_iterations = 50;
-    const float convg_criteria = 1e-7f;
+    const float SEED_PSEUDO_COUNT = 0.5f;
+    const int EM_MAX_ITERATIONS = 50;
+    const float EM_CONVERGENCE = 1e-6f;
     
-    // cout << "=== (Seeded EM Learner) ===" << endl;
+    cout << "=== (Seeded EM Learner) ===" << endl;
     
     network BayesNet = read_network(hailfinder_file);
     if (BayesNet.netSize() == 0) {
-        // cerr << "Fatal Error: Network structure load failed. Cannot proceed." << endl;
+        cerr << "Fatal Error: Network structure load failed. Cannot proceed." << endl;
         return 1;
     }
-    // cout << "Network structure loaded successfully! Nodes: " << BayesNet.netSize() << endl;
+    cout << "Network structure loaded successfully! Nodes: " << BayesNet.netSize() << endl;
     
     vector<vector<string>> raw_data = read_data(data_file);
     if (raw_data.empty()) {
-        // cerr << "Could not read data or data file is empty. Exiting." << endl;
+        cerr << "Could not read data or data file is empty. Exiting." << endl;
         return 1;
     }
-    // cout << "Data loaded successfully! records_data: " << raw_data.size() << endl;
+    cout << "Data loaded successfully! Records: " << raw_data.size() << endl;
 
     map<string, int> var_name_to_id;
     for (int i = 0; i < BayesNet.netSize(); ++i) {
         var_name_to_id[BayesNet.getNode(i)->get_name()] = i;
     }
 
-    // cout << "\n--- Phase 1: Partitioning data ---" << endl;
+    cout << "\n--- Phase 1: Partitioning data ---" << endl;
     vector<vector<string>> complete_rows;
     vector<vector<string>> incomplete_rows;
     
@@ -1320,29 +1185,30 @@ int main(int argc, char* argv[]) {
             incomplete_rows.push_back(record_from_data);
         }
     }
-    // cout << "  Partitioned data: " << complete_rows.size() << " complete rows, " << incomplete_rows.size() << " incomplete rows." << endl;
+    cout << "  Partitioned data: " << complete_rows.size() << " complete rows, " << incomplete_rows.size() << " incomplete rows." << endl;
 
-    // cout << "\n--- Phase 2: Building seed network ---" << endl;
+    cout << "\n--- Phase 2: Building seed network ---" << endl;
          
     if (complete_rows.size() < 100) {
-        // cout << "  Warning: Fewer than 100 complete rows (" << complete_rows.size() << "). Seeding with random probabilities for unknown CPTs." << endl;
+        cout << "  Warning: Fewer than 100 complete rows (" << complete_rows.size() << "). Seeding with random probabilities for unknown CPTs." << endl;
         mt19937 rng(42); 
         
         initialize_cpts_randomly(BayesNet, var_name_to_id, rng); 
         
     } else {
-        // cout << "  Using MLE on " << complete_rows.size() << " complete rows to build seed network..." << endl;
+        cout << "  Using MLE on " << complete_rows.size() << " complete rows to build seed network..." << endl;
         
-        update_cpts_mle_from_complete_data(BayesNet, complete_rows, var_name_to_id, initial_alpha);
+        update_cpts_mle_from_complete_data(BayesNet, complete_rows, var_name_to_id, SEED_PSEUDO_COUNT);
     }
-    // cout << "  Seed network built successfully." << endl;
+    cout << "  Seed network built successfully." << endl;
 
-    // cout << "\n--- Phase 3: Refining network with Full-Batch EM on all " << raw_data.size() << " rows... ---" << endl;
+    cout << "\n--- Phase 3: Refining network with Full-Batch EM on all " 
+         << raw_data.size() << " rows... ---" << endl;
     
     em_call(BayesNet, raw_data, var_name_to_id, 
-                        no_iterations, convg_criteria);
+                        EM_MAX_ITERATIONS, EM_CONVERGENCE);
     
-    // cout << "\n--- Learning complete ---" << endl;
+    cout << "\n--- Learning complete ---" << endl;
     
     write_network(BayesNet, "solved_hailfinder.bif");
 

@@ -9,11 +9,11 @@
 #include <iomanip>
 #include <cmath>
 #include <algorithm> 
-#include <random>       
-#include <numeric>      
-#include <limits>       
-#include <chrono>       
-#include <utility>      
+#include <random>       // For random initialization
+#include <numeric>      // For std::accumulate
+#include <limits>       // For std::numeric_limits
+#include <chrono>       // For time-keeping
+#include <utility>      // For std::pair
 
 using namespace std;
 
@@ -25,19 +25,29 @@ void write_network(const network& BayesNet, const string& filename);
 int get_value_index(const Graph_Node& node, const string& value);
 vector<vector<string>> read_data(const string& filename);
 
-// --- NEW FUNCTION DECLARATIONS (k-NN + MLE) ---
+// --- MODIFIED FUNCTION DECLARATIONS ---
 long long get_parent_config_index(const Graph_Node& node, const network& bn, 
                                   const map<string, int>& name_to_index, 
                                   const map<int, int>& parent_val_indices);
 long long get_cpt_index(const Graph_Node& node, const network& bn, 
                         const map<string, int>& name_to_index, 
                         int child_val_idx, const map<int, int>& parent_val_indices);
-void learn_cpts_mle(network& bn, const vector<vector<string>>& dataset, 
-                    const map<string, int>& name_to_index, float pseudo_count);
-string find_knn_prediction(const vector<string>& incomplete_row, 
-                           const vector<vector<string>>& complete_rows,
-                           int missing_index, int k);
-vector<vector<string>> create_complete_dataset(const vector<vector<string>>& raw_data, int k);
+
+// --- FUNCTIONS RE-ADDED FOR MULTI-START ---
+void initialize_cpts_randomly(network& bn, const map<string, int>& name_to_index,
+                                std::mt19937& rng);
+double calculate_observed_log_likelihood(
+                                  const network& bn, const vector<vector<string>>& raw_data,
+                                  const map<string, int>& name_to_index);
+// ---
+                    
+void learn_parameters_em(network& bn, const vector<vector<string>>& raw_data, 
+                         const map<string, int>& name_to_index,
+                         int N_iterations, float convergence_threshold);
+                         
+pair<vector<float>, double> calculate_posterior_and_likelihood(
+                                  const network& bn, const vector<string>& record,
+                                  int missing_index, const map<string, int>& name_to_index);
 
 
 // ==========================================================================================
@@ -183,6 +193,7 @@ public:
         return Pres_Graph.end();
     }
     
+    // --- Needed for multi-start ---
     network() = default;
     network(const network& other) = default;
     network(network&& other) noexcept = default;
@@ -479,7 +490,7 @@ void write_network(const network& BayesNet, const string& filename) {
         return;
     }
     
-    outfile << "// Bayesian Network (Learned via k-NN Imputation + MLE)" << endl << endl;
+    outfile << "// Bayesian Network (Learned via Multi-Start Full-Batch EM)" << endl << endl;
 
     for (int i = 0; i < BayesNet.netSize(); ++i) {
         auto node_it = BayesNet.getNodeConst(i); 
@@ -608,7 +619,7 @@ vector<vector<string>> read_data(const string& filename) {
 }
 
 // ------------------------------------------------------------------------------------------
-// 2. HELPER FUNCTIONS (MLE + k-NN)
+// 2. HELPER FUNCTIONS
 // ------------------------------------------------------------------------------------------
 
 /**
@@ -640,7 +651,7 @@ long long get_parent_config_index(const Graph_Node& node, const network& bn,
         int val_idx = 0;
         if(parent_val_indices.count(p_idx)) {
              val_idx = parent_val_indices.at(p_idx);
-        } 
+        }
         
         parent_config_index += (long long)val_idx * multiplier;
         
@@ -661,145 +672,213 @@ long long get_cpt_index(const Graph_Node& node, const network& bn,
     return parent_config_index * node.get_nvalues() + child_val_idx;
 }
 
-// ------------------------------------------------------------------------------------------
-// 3. k-NN IMPUTATION
-// ------------------------------------------------------------------------------------------
 
 /**
- * Calculates the Hamming distance between two records, ignoring a specific index.
+ * Calculates posterior P(Xm | d_obs) using LOG PROBABILITIES.
+ * Returns a pair:
+ * 1. The normalized posterior vector (for E-step)
+ * 2. The log-likelihood of the observed data log(P(d_obs)) (for scoring)
  */
-int hamming_distance(const vector<string>& row1, const vector<string>& row2, int ignore_index) {
-    int distance = 0;
-    for (int i = 0; i < row1.size(); ++i) {
-        if (i == ignore_index) continue;
-        if (row1[i] != row2[i]) {
-            distance++;
+pair<vector<float>, double> calculate_posterior_and_likelihood(
+                                  const network& bn, const vector<string>& record,
+                                  int missing_index, const map<string, int>& name_to_index) {
+    
+    auto missing_node_it = bn.getNodeConst(missing_index);
+    int nvalues = missing_node_it->get_nvalues();
+    const float epsilon = 1e-9f; // Epsilon to prevent log(0)
+
+    vector<float> log_posterior(nvalues, 0.0f); // Stores un-normalized log-probs
+
+    // --- Term 1: log( P(Xm | Parents(Xm)) ) ---
+    const auto& parents = missing_node_it->get_Parents();
+    const auto& cpt = missing_node_it->get_CPT();
+    
+    long long xm_parent_config_index = 0;
+    long long multiplier = 1;
+
+    for (const string& pname : parents) {
+        int p_idx = name_to_index.at(pname);
+        auto pnode_it = bn.getNodeConst(p_idx);
+        int val_idx = get_value_index(*pnode_it, record[p_idx]);
+        xm_parent_config_index += (long long)val_idx * multiplier;
+        multiplier *= pnode_it->get_nvalues();
+    }
+
+    for (int k = 0; k < nvalues; ++k) {
+        long long cpt_index = xm_parent_config_index * nvalues + k;
+        float prob = (cpt_index < cpt.size()) ? cpt[cpt_index] : (1.0f / nvalues);
+        log_posterior[k] += log(prob + epsilon);
+    }
+
+    // --- Term 2: sum( log( P(Y | Parents(Y)) ) ) for Y in Children(Xm) ---
+    const auto& children_indices = missing_node_it->get_children();
+    
+    for (int child_idx : children_indices) {
+        auto child_node_it = bn.getNodeConst(child_idx);
+        const auto& child_parents = child_node_it->get_Parents();
+        const auto& child_cpt = child_node_it->get_CPT();
+        int child_nvalues = child_node_it->get_nvalues();
+        
+        string y_val_str = record[child_idx];
+        int y_val_idx = get_value_index(*child_node_it, y_val_str);
+        if (y_val_idx == -1) continue; 
+
+        for (int k = 0; k < nvalues; ++k) { // k is the hypothetical value_index of Xm
+            
+            long long y_parent_config_index = 0;
+            long long y_multiplier = 1;
+
+            for (const string& ypname : child_parents) {
+                int yp_idx = name_to_index.at(ypname);
+                int val_idx = -1;
+
+                if (yp_idx == missing_index) {
+                    val_idx = k; // Use the hypothetical value of Xm
+                } else {
+                    auto ypnode_it = bn.getNodeConst(yp_idx);
+                    val_idx = get_value_index(*ypnode_it, record[yp_idx]);
+                }
+                
+                y_parent_config_index += (long long)val_idx * y_multiplier;
+                
+                auto ypnode_it = bn.getNodeConst(yp_idx); 
+                y_multiplier *= ypnode_it->get_nvalues();
+            }
+
+            long long child_cpt_index = y_parent_config_index * child_nvalues + y_val_idx;
+            float prob = (child_cpt_index < child_cpt.size()) ? child_cpt[child_cpt_index] : (1.0f / child_nvalues);
+            log_posterior[k] += log(prob + epsilon);
         }
     }
-    return distance;
-}
 
-/**
- * Finds the k-nearest neighbors and predicts the missing value by majority vote.
- */
-string find_knn_prediction(const vector<string>& incomplete_row, 
-                           const vector<vector<string>>& complete_rows,
-                           int missing_index, int k) {
+    // --- Normalize using Log-Sum-Exp trick ---
+    vector<float> final_posterior(nvalues);
+    float max_log_prob = *std::max_element(log_posterior.begin(), log_posterior.end());
+    double sum_exp = 0.0;
 
-    // Store distances and the index of the neighbor
-    vector<pair<int, int>> neighbors; // {distance, index_in_complete_rows}
-
-    for (int i = 0; i < complete_rows.size(); ++i) {
-        int dist = hamming_distance(incomplete_row, complete_rows[i], missing_index);
-        neighbors.push_back({dist, i});
+    for (int k = 0; k < nvalues; ++k) {
+        // Use double for intermediate sum to prevent precision loss
+        double val = exp(log_posterior[k] - max_log_prob);
+        final_posterior[k] = (float)val; // Store un-normalized exp
+        sum_exp += val;
     }
-
-    // Sort by distance (ascending)
-    std::sort(neighbors.begin(), neighbors.end());
-
-    // Get the top k neighbors and vote
-    map<string, int> votes;
-    for (int i = 0; i < k && i < neighbors.size(); ++i) {
-        int neighbor_original_index = neighbors[i].second;
-        const string& neighbor_value = complete_rows[neighbor_original_index][missing_index];
-        votes[neighbor_value]++;
-    }
-
-    // Find the value with the most votes
-    string best_value = "";
-    int max_votes = -1;
-    for (const auto& pair : votes) {
-        if (pair.second > max_votes) {
-            max_votes = pair.second;
-            best_value = pair.first;
+    
+    double log_likelihood_of_record = max_log_prob + log(sum_exp + epsilon);
+    
+    if (sum_exp < epsilon) {
+        for (int k = 0; k < nvalues; ++k) {
+            final_posterior[k] = 1.0f / nvalues;
+        }
+    } else {
+        for (int k = 0; k < nvalues; ++k) {
+            final_posterior[k] /= (float)sum_exp;
         }
     }
-    
-    // Fallback in case k=0 or no neighbors (shouldn't happen with reasonable k)
-    if (best_value == "") { 
-        return "True"; // Or any reasonable default
-    }
 
-    return best_value;
+    return {final_posterior, log_likelihood_of_record};
 }
 
+
+// ------------------------------------------------------------------------------------------
+// 3. MLE/RANDOM INITIALIZATION FUNCTIONS
+// ------------------------------------------------------------------------------------------
+
 /**
- * Creates a 100% complete dataset by imputing missing values using k-NN.
+ * Initializes all CPTs to random (but normalized) probabilities.
+ * This is crucial for the multi-start strategy.
  */
-vector<vector<string>> create_complete_dataset(const vector<vector<string>>& raw_data, int k) {
+void initialize_cpts_randomly(network& bn, const map<string, int>& name_to_index,
+                                std::mt19937& rng) {
     
-    vector<vector<string>> complete_rows;
-    vector<vector<string>> incomplete_rows;
-    vector<int> incomplete_indices; // Stores the original index
-    
-    // --- Step 1: Partition the data ---
-    for (int i = 0; i < raw_data.size(); ++i) {
-        bool is_complete = true;
-        for (const string& val : raw_data[i]) {
-            if (val == "?") {
-                is_complete = false;
-                break;
+    std::uniform_real_distribution<float> dist(0.0, 1.0);
+
+    for (int i = 0; i < bn.netSize(); ++i) {
+        auto node_it = bn.getNode(i);
+        int nvalues = node_it->get_nvalues();
+
+        long long cpt_size = nvalues;
+        for (const auto& pname : node_it->get_Parents()) {
+            cpt_size *= bn.getNode(name_to_index.at(pname))->get_nvalues();
+        }
+
+        vector<float> new_cpt(cpt_size);
+        long long parent_configs = cpt_size / nvalues;
+
+        for (long long j = 0; j < parent_configs; ++j) {
+            float sum = 0.0f;
+            for (int k = 0; k < nvalues; ++k) {
+                float rand_val = dist(rng) + 1e-6f; // Add epsilon to avoid 0
+                new_cpt[j * nvalues + k] = rand_val;
+                sum += rand_val;
+            }
+            // Normalize
+            for (int k = 0; k < nvalues; ++k) {
+                new_cpt[j * nvalues + k] /= sum;
             }
         }
-        if (is_complete) {
-            complete_rows.push_back(raw_data[i]);
-        } else {
-            incomplete_rows.push_back(raw_data[i]);
-            incomplete_indices.push_back(i);
-        }
+        node_it->set_CPT(new_cpt);
     }
-    
-    cout << "  Partitioned data: " << complete_rows.size() 
-         << " complete rows, " << incomplete_rows.size() 
-         << " incomplete rows." << endl;
+}
 
-    if (complete_rows.empty()) {
-        cerr << "Error: No complete rows found to train k-NN. Cannot impute." << endl;
-        // As a fallback, just return the raw data (MLE will handle '?')
-        return raw_data;
-    }
-
-    // --- Step 2: Impute missing values ---
-    // We create a final dataset that respects the original order
-    vector<vector<string>> final_imputed_set = raw_data; 
+/**
+ * Scorer function to calculate the total log-likelihood of the
+ * entire observed dataset. Used to compare networks from different restarts.
+ */
+double calculate_observed_log_likelihood(
+                                  const network& bn, const vector<vector<string>>& raw_data,
+                                  const map<string, int>& name_to_index) {
     
-    for (int i = 0; i < incomplete_rows.size(); ++i) {
-        const auto& row = incomplete_rows[i];
-        int original_index = incomplete_indices[i];
-        
+    double total_log_likelihood = 0.0;
+    int n_nodes = bn.netSize();
+
+    for (const auto& record : raw_data) {
         int missing_index = -1;
-        for (int j = 0; j < row.size(); ++j) {
-            if (row[j] == "?") {
+        for(int j=0; j < record.size(); ++j) {
+            if(record[j] == "?") {
                 missing_index = j;
                 break;
             }
         }
-        
-        if (missing_index == -1) continue; // Should not happen here
 
-        // Find the best value using k-NN
-        string predicted_value = find_knn_prediction(row, complete_rows, missing_index, k);
-        
-        // Fill in the '?' in our final dataset
-        final_imputed_set[original_index][missing_index] = predicted_value;
+        if (missing_index == -1) {
+            // --- CASE 1: Complete Row ---
+            double record_log_likelihood = 0.0;
+            for (int i = 0; i < n_nodes; ++i) {
+                auto node_it = bn.getNodeConst(i);
+                int c_val_idx = get_value_index(*node_it, record[i]);
+                if (c_val_idx == -1) continue;
+                
+                map<int, int> parent_val_indices;
+                for(const string& pname : node_it->get_Parents()) {
+                    int p_idx = name_to_index.at(pname);
+                    auto pnode_it = bn.getNodeConst(p_idx);
+                    parent_val_indices[p_idx] = get_value_index(*pnode_it, record[p_idx]);
+                }
+                
+                long long cpt_index = get_cpt_index(*node_it, bn, name_to_index, c_val_idx, parent_val_indices);
+                const auto& cpt = node_it->get_CPT();
+                
+                if(cpt_index < cpt.size()) {
+                    record_log_likelihood += log(cpt[cpt_index] + 1e-9);
+                }
+            }
+            total_log_likelihood += record_log_likelihood;
+        } else {
+            // --- CASE 2: Incomplete Row ---
+            // We only need the second part of the pair: the record's log-likelihood
+            total_log_likelihood += calculate_posterior_and_likelihood(
+                                        bn, record, missing_index, name_to_index).second;
+        }
     }
-    
-    cout << "  Imputation complete. Final dataset has " 
-         << final_imputed_set.size() << " rows." << endl;
-         
-    return final_imputed_set;
+    return total_log_likelihood;
 }
 
 
-// ------------------------------------------------------------------------------------------
-// 4. MLE LEARNING (from a 100% complete dataset)
-// ------------------------------------------------------------------------------------------
-
-/**
- * Learns CPTs from a 100% complete dataset using simple MLE (counting).
- */
+// NOTE: learn_cpts_mle is no longer used for seeding, but
+// is kept here in case it's needed for other strategies.
+// We are using initialize_cpts_randomly instead.
 void learn_cpts_mle(network& bn, const vector<vector<string>>& dataset, 
-                    const map<string, int>& name_to_index, float pseudo_count = 0.1f) {
+                    const map<string, int>& name_to_index, float pseudo_count) {
     
     if (dataset.empty()) {
         cerr << "Error (MLE): Dataset is empty." << endl;
@@ -840,7 +919,7 @@ void learn_cpts_mle(network& bn, const vector<vector<string>>& dataset,
                 int p_idx = name_to_index.at(pname);
                 auto pnode_it = bn.getNodeConst(p_idx);
                 int val_idx = get_value_index(*pnode_it, record[p_idx]);
-                if (val_idx == -1) { // Should not happen with imputed data
+                if (val_idx == -1) { // Should not happen in complete data
                     record_valid = false;
                     break;
                 }
@@ -887,8 +966,213 @@ void learn_cpts_mle(network& bn, const vector<vector<string>>& dataset,
 }
 
 
+// ------------------------------------------------------------------------------------------
+// 4. EM LEARNING FUNCTION (Full-Batch)
+// ------------------------------------------------------------------------------------------
+
+/**
+ * MODIFIED: Implements standard, full-batch EM.
+ * This is now a refinement step, so we don't need mini-batching.
+ * It will run for N_iterations OR until CPTs stop changing.
+ */
+void learn_parameters_em(network& bn, const vector<vector<string>>& raw_data, 
+                         const map<string, int>& name_to_index,
+                         int N_iterations, float convergence_threshold) {
+    
+    int n_nodes = bn.netSize();
+    const float pseudo_count = 0.5f; // Standard smoothing for all EM steps
+
+    for (int iter = 0; iter < N_iterations; ++iter) {
+        
+        // --- E-STEP: Calculate Expected Counts from FULL Dataset ---
+        map<int, vector<float>> expected_numerators;
+        map<int, vector<float>> expected_denominators;
+
+        // Initialize all counts to 0.0f
+        for (int i = 0; i < n_nodes; ++i) {
+            auto node_it = bn.getNode(i);
+            int nvalues = node_it->get_nvalues();
+            long long cpt_size = nvalues;
+            for(const auto& pname : node_it->get_Parents()) {
+                cpt_size *= bn.getNode(name_to_index.at(pname))->get_nvalues();
+            }
+            
+            long long denom_size = cpt_size / nvalues;
+            expected_numerators[i] = vector<float>(cpt_size, 0.0f);
+            expected_denominators[i] = vector<float>(denom_size, 0.0f);
+        }
+
+        // --- Process the FULL dataset ---
+        for (const auto& record : raw_data) {
+            
+            int missing_index = -1;
+            for(int j=0; j < record.size(); ++j) {
+                if(record[j] == "?") {
+                    missing_index = j;
+                    break;
+                }
+            }
+
+            if (missing_index == -1) {
+                // --- CASE 1: Complete Row ---
+                for (int i = 0; i < n_nodes; ++i) {
+                    auto node_it = bn.getNodeConst(i);
+                    int c_val_idx = get_value_index(*node_it, record[i]);
+                    if(c_val_idx == -1) continue;
+                    
+                    map<int, int> parent_val_indices;
+                    for(const string& pname : node_it->get_Parents()) {
+                        int p_idx = name_to_index.at(pname);
+                        auto pnode_it = bn.getNodeConst(p_idx);
+                        parent_val_indices[p_idx] = get_value_index(*pnode_it, record[p_idx]);
+                    }
+
+                    long long parent_config_index = get_parent_config_index(*node_it, bn, name_to_index, parent_val_indices);
+                    long long num_index = get_cpt_index(*node_it, bn, name_to_index, c_val_idx, parent_val_indices);
+                    
+                    expected_numerators[i][num_index] += 1.0f;
+                    expected_denominators[i][parent_config_index] += 1.0f;
+                }
+
+            } else {
+                // --- CASE 2: Incomplete Row (Xm is missing) ---
+                vector<float> posterior = calculate_posterior_and_likelihood(
+                                              bn, record, missing_index, name_to_index).first;
+                int xm_nvalues = bn.getNode(missing_index)->get_nvalues();
+
+                for (int i = 0; i < n_nodes; ++i) {
+                    auto node_it = bn.getNodeConst(i);
+                    const auto& parents = node_it->get_Parents();
+                    int nvalues = node_it->get_nvalues();
+                    
+                    bool is_missing_node = (i == missing_index);
+                    bool is_child_of_missing = false;
+                    for (const auto& pname : parents) {
+                        if (name_to_index.at(pname) == missing_index) {
+                            is_child_of_missing = true;
+                            break;
+                        }
+                    }
+
+                    if (!is_missing_node && !is_child_of_missing) {
+                        // Node is unrelated. Treat as complete.
+                        int c_val_idx = get_value_index(*node_it, record[i]);
+                        if (c_val_idx == -1) continue;
+
+                        map<int, int> parent_val_indices;
+                        for(const string& pname : parents) {
+                            int p_idx = name_to_index.at(pname);
+                            auto pnode_it = bn.getNodeConst(p_idx);
+                            parent_val_indices[p_idx] = get_value_index(*pnode_it, record[p_idx]);
+                        }
+                        
+                        long long parent_config_index = get_parent_config_index(*node_it, bn, name_to_index, parent_val_indices);
+                        long long num_index = get_cpt_index(*node_it, bn, name_to_index, c_val_idx, parent_val_indices);
+
+                        expected_numerators[i][num_index] += 1.0f;
+                        expected_denominators[i][parent_config_index] += 1.0f;
+
+                    } else if (is_missing_node) {
+                        // Node *is* the missing one (Xm)
+                        long long parent_config_index = 0;
+                        long long multiplier = 1;
+                        for(const string& pname : parents) {
+                            int p_idx = name_to_index.at(pname);
+                            auto pnode_it = bn.getNodeConst(p_idx);
+                            int val_idx = get_value_index(*pnode_it, record[p_idx]);
+                            parent_config_index += (long long)val_idx * multiplier;
+                            multiplier *= pnode_it->get_nvalues();
+                        }
+                        for (int k = 0; k < xm_nvalues; ++k) {
+                            long long num_index = parent_config_index * nvalues + k;
+                            expected_numerators[i][num_index] += posterior[k];
+                            expected_denominators[i][parent_config_index] += posterior[k];
+                        }
+                    } else if (is_child_of_missing) {
+                        // Node is a child (Y) of the missing one (Xm)
+                        int y_val_idx = get_value_index(*node_it, record[i]);
+                        if (y_val_idx == -1) continue;
+                        
+                        for (int k = 0; k < xm_nvalues; ++k) { // k is hypothetical value_index of Xm
+                            long long parent_config_index = 0;
+                            long long multiplier = 1;
+                            for(const string& pname : parents) {
+                                int p_idx = name_to_index.at(pname);
+                                int val_idx = -1;
+                                if (p_idx == missing_index) {
+                                    val_idx = k; // Use hypothetical value
+                                } else {
+                                    auto pnode_it = bn.getNodeConst(p_idx);
+                                    val_idx = get_value_index(*pnode_it, record[p_idx]);
+                                }
+                                parent_config_index += (long long)val_idx * multiplier;
+                                auto pnode_it = bn.getNodeConst(p_idx);
+                                multiplier *= pnode_it->get_nvalues();
+                            }
+                            
+                            long long num_index = parent_config_index * nvalues + y_val_idx;
+                            expected_numerators[i][num_index] += posterior[k];
+                            expected_denominators[i][parent_config_index] += posterior[k];
+                        }
+                    }
+                }
+            }
+        } // end for full-batch
+
+        // --- M-STEP: Recompute CPTs from Expected Counts ---
+        
+        float max_change = 0.0f; // For checking convergence
+
+        for (int i = 0; i < n_nodes; ++i) {
+            auto node_it = bn.getNode(i);
+            int nvalues = node_it->get_nvalues();
+            const auto& old_cpt = node_it->get_CPT();
+            vector<float> new_cpt(old_cpt.size());
+            
+            const auto& numerators = expected_numerators.at(i);
+            const auto& denominators = expected_denominators.at(i);
+            
+            for (int j = 0; j < denominators.size(); ++j) { // For each parent config
+                
+                // Get the counts for this batch
+                float total_count = denominators[j];
+                
+                // Apply smoothing
+                float smoothed_den = total_count + (pseudo_count * nvalues);
+
+                for (int k = 0; k < nvalues; ++k) { // For each child value
+                    long long cpt_index = (long long)j * nvalues + k;
+                    float smoothed_num = numerators[cpt_index] + pseudo_count;
+                    
+                    if (smoothed_den < 1e-9) {
+                        new_cpt[cpt_index] = 1.0f / nvalues;
+                    } else {
+                        new_cpt[cpt_index] = smoothed_num / smoothed_den;
+                    }
+                    
+                    // Track max change
+                    if(cpt_index < old_cpt.size()) {
+                        max_change = std::max(max_change, std::fabs(new_cpt[cpt_index] - old_cpt[cpt_index]));
+                    }
+                }
+            }
+            node_it->set_CPT(new_cpt);
+        }
+
+        cout << "  ... Iteration " << iter + 1 << " complete. Max CPT change: " << max_change << endl;
+
+        // Check for convergence
+        if (max_change < convergence_threshold) {
+            cout << "  ... Converged after " << iter + 1 << " iterations." << endl;
+            break;
+        }
+
+    } // end for iterations
+}
+
+
 // ==========================================================================================
-// MAIN FUNCTION (k-NN + MLE Controller)
+// MAIN FUNCTION (Seeded EM Controller)
 // ==========================================================================================
 
 #ifndef BN_LIB
@@ -901,14 +1185,15 @@ int main(int argc, char* argv[]) {
     string hailfinder_file = argv[1];
     string data_file = argv[2];
 
-    // --- k-NN Hyperparameters ---
-    const int K_NEIGHBORS = 30;      // Number of neighbors to use for voting
-    const float PSEUDO_COUNT = 0.1f; // Smoothing for the final MLE
-    // ----------------------------
+    // --- Algorithm Hyperparameters ---
+    const float SEED_PSEUDO_COUNT = 0.1f;  // Smoothing for the initial MLE seed
+    const int EM_MAX_ITERATIONS = 100;     // Max iterations for refinement
+    const float EM_CONVERGENCE = 1e-6f;  // Stop when CPTs change by less than this
+    // ---------------------------------
     
-    cout << "=== k-NN Imputation + MLE Learner ===" << endl;
+    cout << "=== Seeded EM Learner ===" << endl;
     
-    // --- Load Data and Network Structure ---
+    // --- Load Data and Initial Network Structure ---
     network BayesNet = read_network(hailfinder_file);
     if (BayesNet.netSize() == 0) {
         cerr << "Fatal Error: Network structure load failed. Cannot proceed." << endl;
@@ -929,15 +1214,58 @@ int main(int argc, char* argv[]) {
         name_to_index[BayesNet.getNode(i)->get_name()] = i;
     }
 
-    // --- Phase 1: Impute Data using k-NN ---
-    cout << "\n--- Phase 1: Imputing missing data using k-NN (k=" 
-         << K_NEIGHBORS << ") ---" << endl;
-    vector<vector<string>> complete_dataset = create_complete_dataset(raw_data, K_NEIGHBORS);
+    // --- Phase 1: Partition Data ---
+    cout << "\n--- Phase 1: Partitioning data ---" << endl;
+    vector<vector<string>> complete_rows;
+    vector<vector<string>> incomplete_rows;
     
-    // --- Phase 2: Learn CPTs using MLE ---
-    cout << "\n--- Phase 2: Learning CPTs from complete data (pseudo_count=" 
-         << PSEUDO_COUNT << ") ---" << endl;
-    learn_cpts_mle(BayesNet, complete_dataset, name_to_index, PSEUDO_COUNT);
+    for (const auto& record : raw_data) {
+        bool is_complete = true;
+        for (const string& val : record) {
+            if (val == "?") {
+                is_complete = false;
+                break;
+            }
+        }
+        if (is_complete) {
+            complete_rows.push_back(record);
+        } else {
+            incomplete_rows.push_back(record);
+        }
+    }
+    cout << "  Partitioned data: " << complete_rows.size() 
+         << " complete rows, " << incomplete_rows.size() 
+         << " incomplete rows." << endl;
+
+    // --- Phase 2: Create a High-Quality "Seed Network" ---
+    cout << "\n--- Phase 2: Building seed network from " << complete_rows.size() 
+         << " complete rows... ---" << endl;
+         
+    if (complete_rows.empty()) {
+        cerr << "  Warning: No complete rows found. Seeding with uniform probabilities." << endl;
+        // This is a fallback, but it's unlikely given the dataset
+        std::mt19937 rng(std::random_device{}()); // Need to include <random>
+        // We'll just have to use the original random init.
+        // Let's create a minimal uniform initializer.
+        for (int i = 0; i < BayesNet.netSize(); ++i) {
+            auto node_it = BayesNet.getNode(i);
+            int nvalues = node_it->get_nvalues();
+            long long cpt_size = node_it->get_CPT().size();
+            vector<float> uniform_cpt(cpt_size, 1.0f / nvalues);
+            node_it->set_CPT(uniform_cpt);
+        }
+    } else {
+        // This is the main path
+        learn_cpts_mle(BayesNet, complete_rows, name_to_index, SEED_PSEUDO_COUNT);
+    }
+    cout << "  Seed network built successfully." << endl;
+
+    // --- Phase 3: Refine with Full-Batch EM ---
+    cout << "\n--- Phase 3: Refining network with Full-Batch EM on all " 
+         << raw_data.size() << " rows... ---" << endl;
+    
+    learn_parameters_em(BayesNet, raw_data, name_to_index, 
+                        EM_MAX_ITERATIONS, EM_CONVERGENCE);
     
     cout << "\n--- Learning complete ---" << endl;
     
